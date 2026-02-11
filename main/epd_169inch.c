@@ -552,6 +552,43 @@ static void send_hv_stripe_image_data(const uint8_t *pic)
     ESP_LOGI(TAG, "Image data sent");
 }
 
+static void send_hv_stripe_image_data_byte(const uint8_t *pic)
+{
+    uint32_t yield_counter = 0;
+
+    ESP_LOGI(TAG, "Sending byte-packed image data to MASTER (rows 0-99)");
+    msdev_write_com(MASTER_ONLY, 0x00);
+    msdev_write_data(MASTER_ONLY, 0x13);
+    msdev_write_data(MASTER_ONLY, 0xE9);
+
+    msdev_write_com(MASTER_ONLY, 0x10);
+    delay_ms(10);
+    for (uint16_t col = 0; col < 400; col++) {
+        for (uint16_t row = 0; row < 100; row++) {
+            uint32_t index = (col * 200U) + (row * 2U);
+            msdev_write_data(MASTER_ONLY, pic[index]);
+            yield_if_needed(&yield_counter);
+        }
+    }
+
+    ESP_LOGI(TAG, "Sending byte-packed image data to SLAVE (rows 100-199)");
+    msdev_write_com(SLAVE_ONLY, 0x00);
+    msdev_write_data(SLAVE_ONLY, 0x17);
+    msdev_write_data(SLAVE_ONLY, 0xE9);
+
+    msdev_write_com(SLAVE_ONLY, 0x10);
+    delay_ms(10);
+    for (uint16_t col = 0; col < 400; col++) {
+        for (uint16_t row = 0; row < 100; row++) {
+            uint32_t index = (col * 200U) + (row * 2U);
+            msdev_write_data(SLAVE_ONLY, pic[index + 1]);
+            yield_if_needed(&yield_counter);
+        }
+    }
+
+    ESP_LOGI(TAG, "Byte-packed image data sent");
+}
+
 static void send_hv_stripe_clean_data(void)
 {
     uint32_t yield_counter = 0;
@@ -646,7 +683,7 @@ void epd_demo_run(void)
     // delay_s(3);
     ESP_LOGI(TAG, "Starting image display");
     read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_image_data(gImagetest);
+    send_hv_stripe_image_data_byte(gImagetest2);
     epd_display(PIC_A);
     enter_deepsleep();
 

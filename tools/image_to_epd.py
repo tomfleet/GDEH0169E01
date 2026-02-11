@@ -108,7 +108,7 @@ def apply_round_mask(img: Image.Image) -> None:
                 pixels[x, y] = (255, 255, 255)
 
 
-def image_to_bytes(img: Image.Image, dither: bool) -> bytearray:
+def image_to_bytes(img: Image.Image, dither: bool, packing: str) -> bytearray:
     size = img.size[0]
     if size % 2 != 0:
         raise ValueError("Image size must be even")
@@ -118,6 +118,20 @@ def image_to_bytes(img: Image.Image, dither: bool) -> bytearray:
     else:
         pixels = img.load()
     out = bytearray()
+    if packing == "sp6":
+        for y in range(size - 1, -1, -1):
+            pending = 0
+            for x in range(size - 1, -1, -1):
+                if dither:
+                    value = nearest_color(dithered[y][x])
+                else:
+                    value = nearest_color(pixels[x, y])
+                if (x & 1) == 0:
+                    pending = value
+                else:
+                    out.append((pending << 4) | value)
+        return out
+
     for x in range(size):
         for y in range(half):
             if dither:
@@ -126,7 +140,11 @@ def image_to_bytes(img: Image.Image, dither: bool) -> bytearray:
             else:
                 upper = nearest_color(pixels[x, y])
                 lower = nearest_color(pixels[x, y + half])
-            out.append((upper << 4) | lower)
+            if packing == "byte":
+                out.append((upper << 4) | upper)
+                out.append((lower << 4) | lower)
+            else:
+                out.append((upper << 4) | lower)
     return out
 
 
@@ -172,6 +190,12 @@ def main() -> int:
         default=0,
         help="Rotate image clockwise (degrees)",
     )
+    parser.add_argument(
+        "--packing",
+        choices=["nibble", "byte", "sp6"],
+        default="sp6",
+        help="Output packing: sp6 (default), nibble, or byte (0x11/0x22/etc)",
+    )
     args = parser.parse_args()
 
     img = Image.open(args.input).convert("RGB")
@@ -190,8 +214,10 @@ def main() -> int:
     if args.round_mask:
         apply_round_mask(img)
 
-    data = image_to_bytes(img, dither=args.dither == "fs")
+    data = image_to_bytes(img, dither=args.dither == "fs", packing=args.packing)
     expected = args.size * args.size // 2
+    if args.packing == "byte":
+        expected = args.size * args.size
     if len(data) != expected:
         raise RuntimeError(f"Unexpected output size: {len(data)} (expected {expected})")
 
