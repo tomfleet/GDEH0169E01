@@ -5,13 +5,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 
 #include "pins.h"
 #include "image.h"
-
+#include "image2.h"
 #define MASTER_ONLY 0
 #define SLAVE_ONLY 1
 #define MASTER_SLAVE 2
@@ -31,10 +33,16 @@
 #define STRIPE 0xFE
 #define IMAGE 0xFF
 
+#define EPD_SPI_HOST SPI2_HOST
+#define EPD_SPI_CLOCK_HZ 250000
+
 static const char *TAG = "epd_169";
 
 static uint8_t temptr_cur;
 static uint8_t otp_pwr[5];
+
+static spi_device_handle_t spi_handle;
+static bool spi_ready;
 
 static inline void delay_us(uint32_t time_us)
 {
@@ -66,10 +74,14 @@ static void delay_s(uint32_t time_s)
     vTaskDelay(pdMS_TO_TICKS(time_s * 1000U));
 }
 
-static inline void sda_high(void) { gpio_set_level(PIN_SDA, 1); }
-static inline void sda_low(void) { gpio_set_level(PIN_SDA, 0); }
-static inline void sclk_high(void) { gpio_set_level(PIN_SCL, 1); }
-static inline void sclk_low(void) { gpio_set_level(PIN_SCL, 0); }
+static inline void yield_if_needed(uint32_t *counter)
+{
+    (*counter)++;
+    if ((*counter % 2000U) == 0U) {
+        vTaskDelay(1);
+    }
+}
+
 static inline void nrst_high(void) { gpio_set_level(PIN_RES, 1); }
 static inline void nrst_low(void) { gpio_set_level(PIN_RES, 0); }
 static inline void ndc_high(void) { gpio_set_level(PIN_DC, 1); }
@@ -81,14 +93,66 @@ static inline void csb2_low(void) { gpio_set_level(PIN_CSB2, 0); }
 static inline void ms_high(void) { gpio_set_level(PIN_MS, 1); }
 static inline void ms_low(void) { gpio_set_level(PIN_MS, 0); }
 
+static void spi_init(void)
+{
+    if (spi_ready) {
+        return;
+    }
+
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = PIN_SDA,
+        .miso_io_num = -1,
+        .sclk_io_num = PIN_SCL,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 0,
+    };
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = EPD_SPI_CLOCK_HZ,
+        .mode = 0,
+        .spics_io_num = -1,
+        .queue_size = 1,
+        .flags = SPI_DEVICE_3WIRE | SPI_DEVICE_HALFDUPLEX,
+    };
+
+    esp_err_t ret = spi_bus_initialize(EPD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    ESP_ERROR_CHECK(spi_bus_add_device(EPD_SPI_HOST, &devcfg, &spi_handle));
+    spi_ready = true;
+}
+
+static void spi_write_byte(uint8_t value)
+{
+    spi_transaction_t t = {
+        .length = 8,
+        .flags = SPI_TRANS_USE_TXDATA,
+    };
+    t.tx_data[0] = value;
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_handle, &t));
+}
+
+static uint8_t spi_read_byte(void)
+{
+    spi_transaction_t t = {
+        .length = 0,
+        .rxlength = 8,
+        .flags = SPI_TRANS_USE_RXDATA,
+    };
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_handle, &t));
+    return t.rx_data[0];
+}
+
 static void sys_init(void)
 {
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask = (1ULL << PIN_RES) | (1ULL << PIN_DC) | (1ULL << PIN_CS) |
-                        (1ULL << PIN_CSB2) | (1ULL << PIN_MS) | (1ULL << PIN_SCL) |
-                        (1ULL << PIN_SDA),
+                        (1ULL << PIN_CSB2) | (1ULL << PIN_MS),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE,
     };
@@ -103,16 +167,14 @@ static void sys_init(void)
     csb_high();
     csb2_high();
     ms_high();
-    sclk_low();
-    sda_high();
 
     gpio_set_level(PIN_RES, 1);
     gpio_set_level(PIN_DC, 1);
     gpio_set_level(PIN_CS, 1);
     gpio_set_level(PIN_CSB2, 1);
     gpio_set_level(PIN_MS, 1);
-    gpio_set_level(PIN_SCL, 0);
-    gpio_set_level(PIN_SDA, 1);
+
+    spi_init();
 }
 
 static void read_busy(void)
@@ -146,86 +208,25 @@ static void reset_panel(void)
 
 static void spi4w_write_com(uint8_t init_com)
 {
-    uint8_t temp_com = init_com;
-
-    gpio_set_direction(PIN_SDA, GPIO_MODE_OUTPUT);
-    sclk_low();
-    delay_us(2);
     ndc_low();
-    delay_us(2);
-
-    for (uint8_t scnt = 0; scnt < 8; scnt++) {
-        if (temp_com & 0x80) {
-            sda_high();
-        } else {
-            sda_low();
-        }
-
-        delay_us(1);
-        sclk_high();
-        delay_us(2);
-        sclk_low();
-        temp_com <<= 1;
-    }
-
-    delay_us(2);
+    delay_us(1);
+    spi_write_byte(init_com);
+    delay_us(1);
 }
 
 static void spi4w_write_data(uint8_t init_data)
 {
-    uint8_t temp_data = init_data;
-
-    gpio_set_direction(PIN_SDA, GPIO_MODE_OUTPUT);
-    sclk_low();
-    delay_us(2);
     ndc_high();
-    delay_us(2);
-
-    for (uint8_t scnt = 0; scnt < 8; scnt++) {
-        if (temp_data & 0x80) {
-            sda_high();
-        } else {
-            sda_low();
-        }
-
-        delay_us(1);
-        sclk_high();
-        delay_us(2);
-        sclk_low();
-        temp_data <<= 1;
-    }
-
-    delay_us(2);
+    delay_us(1);
+    spi_write_byte(init_data);
+    delay_us(1);
 }
 
 static uint8_t spi4w_read_data(void)
 {
-    uint8_t temp = 0;
-
-    gpio_set_direction(PIN_SDA, GPIO_MODE_INPUT);
-    delay_us(1);
-    sclk_low();
-    delay_us(2);
     ndc_high();
-    delay_us(2);
-
-    for (uint8_t scnt = 0; scnt < 8; scnt++) {
-        sclk_high();
-        delay_us(2);
-        if (gpio_get_level(PIN_SDA)) {
-            temp = (temp << 1) | 0x01;
-        } else {
-            temp <<= 1;
-        }
-
-        delay_us(1);
-        sclk_low();
-        delay_us(2);
-    }
-
-    delay_us(2);
-    gpio_set_direction(PIN_SDA, GPIO_MODE_OUTPUT);
-    return temp;
+    delay_us(1);
+    return spi_read_byte();
 }
 
 static void msdev_write_com(uint8_t ms_opt, uint8_t init_com)
@@ -447,6 +448,8 @@ static void enter_deepsleep(void)
 
 static void send_hv_stripe_data(void)
 {
+    uint32_t yield_counter = 0;
+
     ESP_LOGI(TAG, "Sending stripe data to MASTER");
     msdev_write_com(MASTER_ONLY, 0x00);
     msdev_write_data(MASTER_ONLY, 0x13);
@@ -471,6 +474,7 @@ static void send_hv_stripe_data(void)
             } else {
                 msdev_write_data(MASTER_ONLY, WHITE);
             }
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -498,6 +502,7 @@ static void send_hv_stripe_data(void)
             } else {
                 msdev_write_data(SLAVE_ONLY, WHITE);
             }
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -506,6 +511,8 @@ static void send_hv_stripe_data(void)
 
 static void send_hv_stripe_image_data(const uint8_t *pic)
 {
+    uint32_t yield_counter = 0;
+
     ESP_LOGI(TAG, "Sending image data to MASTER (rows 0-99)");
     msdev_write_com(MASTER_ONLY, 0x00);
     msdev_write_data(MASTER_ONLY, 0x13);
@@ -520,6 +527,7 @@ static void send_hv_stripe_image_data(const uint8_t *pic)
             uint8_t temp2 = (uint8_t)(pic[index + 1] >> 4);
             uint8_t temp = (uint8_t)(temp1 | temp2);
             msdev_write_data(MASTER_ONLY, temp);
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -537,6 +545,7 @@ static void send_hv_stripe_image_data(const uint8_t *pic)
             uint8_t temp2 = (uint8_t)(pic[index + 1] & 0x0F);
             uint8_t temp = (uint8_t)(temp1 | temp2);
             msdev_write_data(SLAVE_ONLY, temp);
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -545,6 +554,8 @@ static void send_hv_stripe_image_data(const uint8_t *pic)
 
 static void send_hv_stripe_clean_data(void)
 {
+    uint32_t yield_counter = 0;
+
     ESP_LOGI(TAG, "Sending full white data to MASTER");
     msdev_write_com(MASTER_ONLY, 0x00);
     msdev_write_data(MASTER_ONLY, 0x13);
@@ -555,6 +566,7 @@ static void send_hv_stripe_clean_data(void)
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             msdev_write_data(MASTER_ONLY, WHITE);
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -568,6 +580,7 @@ static void send_hv_stripe_clean_data(void)
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             msdev_write_data(SLAVE_ONLY, WHITE);
+            yield_if_needed(&yield_counter);
         }
     }
 
@@ -615,32 +628,32 @@ void epd_demo_run(void)
         ESP_LOGW(TAG, "SPI communication may have issues. Check connections!");
     }
 
-    ESP_LOGI(TAG, "Starting color bar display");
+    //ESP_LOGI(TAG, "Starting color bar display");
     reset_panel();
     read_busy();
+    // read_otp_pwr(TEMPTR_ON);
+    // send_hv_stripe_data();
+    // epd_display(PIC_A);
+    // enter_deepsleep();
+
+    // delay_s(3);
+
+    // read_otp_pwr(TEMPTR_ON);
+    // send_hv_stripe_image_data(gImage1);
+    // epd_display(PIC_A);
+    // enter_deepsleep();
+
+    // delay_s(3);
+    ESP_LOGI(TAG, "Starting image display");
     read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_data();
+    send_hv_stripe_image_data(gImagetest);
     epd_display(PIC_A);
     enter_deepsleep();
 
-    delay_s(3);
+    delay_s(5);
 
-    read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_image_data(gImage1);
-    epd_display(PIC_A);
-    enter_deepsleep();
-
-    delay_s(3);
-
-    read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_image_data(gImage2);
-    epd_display(PIC_A);
-    enter_deepsleep();
-
-    delay_s(3);
-
-    read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_clean_data();
-    epd_display(PIC_A);
-    enter_deepsleep();
+    // read_otp_pwr(TEMPTR_ON);
+    // send_hv_stripe_clean_data();
+    // epd_display(PIC_A);
+    // enter_deepsleep();
 }
