@@ -10,7 +10,7 @@
 #define MS_PIN      42   // MS
 #define BUSY_PIN    5    // Busy信号
 #define SCLK_PIN    12   // SCLK
-#define MOSI_PIN    11   // MOSI (也用作MISO)
+#define MOSI_PIN    13   // MOSI (也用作MISO)
 
 // 模式定义（修正定义以匹配函数逻辑：0-主IC独占，1-从IC独占，2-主从IC共用）
 #define MASTER_ONLY         0

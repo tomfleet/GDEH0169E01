@@ -2,9 +2,9 @@
 - 400x400px
 - 6 colours "states" = White State (WS), Dark State (DS), Red State (RS), Yellow State (YS), Blue State (BS), Green State (GS) - ordering?
 
-Adapter board Pinout
+Adapter board Pinout -
 
-    1. +3v3
+    1. +3v3  - 
     2. GND
     3. SDA
     4. SCL
@@ -14,3 +14,17 @@ Adapter board Pinout
     8. BUSY
     9. MS
     10. CSB2
+
+     actually this is bullshit and the real world pinout is
+    
+        ADAPTOR PIN     WIRE Color      S3-PRO PIN
+    1.  GND             BROWN           GND
+    2.  +3v3            RED             +3V3
+    3.  BUSY            ORANGE          5
+    4.  RES             YELLOW          4
+    5.  DC#             GREEN           3
+    6.  CS              BLUE            2   //MASTER CS
+    7.  SCL             PURPLE          12
+    8.  SDA             GREY            13
+    9.  CSB2            WHITE           1   //SLAVE CS?
+    10. MS              BLACK           42
