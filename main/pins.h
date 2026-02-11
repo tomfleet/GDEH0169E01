@@ -17,13 +17,13 @@ Adapter board Pinout
 
 #define PINS_H  
 // Pin definitions
-#define PIN_SDA 3
-#define PIN_SCL 4
-#define PIN_CS 5
-#define PIN_DC 6
-#define PIN_RES 7
-#define PIN_BUSY 8
-#define PIN_MS 9
-#define PIN_CSB2 10
+#define PIN_SDA 13
+#define PIN_SCL 12
+#define PIN_CS 2
+#define PIN_DC 3
+#define PIN_RES 4
+#define PIN_BUSY 5
+#define PIN_MS 42
+#define PIN_CSB2 1
 
 #endif // PINS_H
