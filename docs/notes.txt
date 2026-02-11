@@ -1,0 +1,16 @@
+- 1.69" round display
+- 400x400px
+- 6 colours "states" = White State (WS), Dark State (DS), Red State (RS), Yellow State (YS), Blue State (BS), Green State (GS) - ordering?
+
+Adapter board Pinout
+
+    1. +3v3
+    2. GND
+    3. SDA
+    4. SCL
+    5. CS
+    6. DC
+    7. RES#
+    8. BUSY
+    9. MS
+    10. CSB2
