@@ -74,6 +74,41 @@
           </div>
         </div>
       </section>
+
+      <section class="panel">
+        <div class="panel__left">
+          <div class="canvas-wrap">
+            <canvas id="scd30Graph" width="400" height="240"></canvas>
+            <div class="canvas-label">SCD30 Graph</div>
+          </div>
+        </div>
+        <div class="panel__right">
+          <div class="controls">
+            <div class="control">
+              <span>Latest</span>
+              <div id="scd30Latest">No data yet</div>
+            </div>
+            <div class="control row">
+              <button id="scd30RenderBtn">Draw graph on EPD</button>
+              <button id="scd30RefreshBtn">Refresh web graph</button>
+            </div>
+            <div class="control row">
+              <label><input id="scd30Auto" type="checkbox" /> Auto render to EPD</label>
+            </div>
+            <label class="control">
+              <span>Interval (minutes)</span>
+              <input id="scd30Interval" type="number" min="1" max="1440" step="1" value="10" />
+            </label>
+            <div class="control row">
+              <button id="scd30ApplyAuto">Apply auto render</button>
+            </div>
+            <div class="control">
+              <span>History window</span>
+              <div id="scd30Window">30 min</div>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
 
     <script src="/app.js"></script>

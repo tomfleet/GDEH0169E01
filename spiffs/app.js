@@ -13,6 +13,15 @@ const downloadBtn = document.getElementById("downloadBtn");
 const statusEl = document.getElementById("status");
 const deviceUrlInput = document.getElementById("deviceUrl");
 
+const scd30GraphCanvas = document.getElementById("scd30Graph");
+const scd30RenderBtn = document.getElementById("scd30RenderBtn");
+const scd30RefreshBtn = document.getElementById("scd30RefreshBtn");
+const scd30AutoCheckbox = document.getElementById("scd30Auto");
+const scd30IntervalInput = document.getElementById("scd30Interval");
+const scd30ApplyAutoBtn = document.getElementById("scd30ApplyAuto");
+const scd30LatestEl = document.getElementById("scd30Latest");
+const scd30WindowEl = document.getElementById("scd30Window");
+
 const PALETTE = [
   { name: "black", rgb: [0, 0, 0], code: 0x0 },
   { name: "white", rgb: [255, 255, 255], code: 0x1 },
@@ -56,6 +65,116 @@ function formatRatio(compressed, raw) {
 function updateGreenBoostLabel() {
   if (greenBoostValue) {
     greenBoostValue.textContent = `${greenBoost.toFixed(2)}x`;
+  }
+}
+
+async function fetchScd30Latest() {
+  if (!scd30LatestEl) return;
+  try {
+    const response = await fetch("/scd30");
+    if (!response.ok) {
+      scd30LatestEl.textContent = "No data";
+      return;
+    }
+    const data = await response.json();
+    scd30LatestEl.textContent = `CO2 ${data.co2_ppm.toFixed(0)} ppm, T ${data.temperature_c.toFixed(1)} C, RH ${data.humidity_rh.toFixed(1)} %`;
+  } catch (err) {
+    scd30LatestEl.textContent = "No data";
+  }
+}
+
+function drawScd30Graph(payload) {
+  if (!scd30GraphCanvas || !payload || !payload.points) return;
+  const ctx = scd30GraphCanvas.getContext("2d");
+  const width = scd30GraphCanvas.width;
+  const height = scd30GraphCanvas.height;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#f7f5f1";
+  ctx.fillRect(0, 0, width, height);
+
+  const margin = { left: 40, right: 12, top: 16, bottom: 30 };
+  const plot = {
+    x: margin.left,
+    y: margin.top,
+    w: width - margin.left - margin.right,
+    h: height - margin.top - margin.bottom,
+  };
+
+  ctx.strokeStyle = "#121317";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plot.x, plot.y, plot.w, plot.h);
+
+  const windowMs = (payload.window_sec || 1800) * 1000;
+  const points = payload.points;
+  const minmax = payload.minmax || {};
+
+  const series = [
+    { key: "co2", color: "#d4512b", min: minmax.co2_min, max: minmax.co2_max },
+    { key: "t", color: "#1f8a8a", min: minmax.temp_min, max: minmax.temp_max },
+    { key: "rh", color: "#2a9d55", min: minmax.rh_min, max: minmax.rh_max },
+  ];
+
+  for (const s of series) {
+    ctx.beginPath();
+    ctx.strokeStyle = s.color;
+    let started = false;
+    for (const pt of points) {
+      const t = 1 - Math.min(1, pt.age_ms / windowMs);
+      const x = plot.x + t * plot.w;
+      const min = s.min ?? 0;
+      const max = s.max ?? 1;
+      const span = Math.max(0.001, max - min);
+      const value = (pt[s.key] - min) / span;
+      const y = plot.y + plot.h - value * plot.h;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#121317";
+  ctx.font = "12px Space Grotesk, sans-serif";
+  ctx.fillText("CO2", plot.x, height - 10);
+  ctx.fillText("T", plot.x + 40, height - 10);
+  ctx.fillText("RH", plot.x + 65, height - 10);
+
+  if (scd30WindowEl && payload.window_sec) {
+    const minutes = Math.round(payload.window_sec / 60);
+    scd30WindowEl.textContent = `${minutes} min`;
+  }
+}
+
+async function refreshScd30Graph() {
+  if (!scd30GraphCanvas) return;
+  try {
+    const response = await fetch("/scd30/history");
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    drawScd30Graph(payload);
+  } catch (err) {
+    // Ignore
+  }
+}
+
+async function applyScd30Auto() {
+  if (!scd30ApplyAutoBtn || !scd30AutoCheckbox || !scd30IntervalInput) return;
+  const enabled = scd30AutoCheckbox.checked ? 1 : 0;
+  const minutes = Math.max(1, Number(scd30IntervalInput.value || 1));
+  const interval = Math.round(minutes * 60);
+  try {
+    await fetch("/scd30/auto", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `enabled=${enabled}&interval=${interval}`,
+    });
+  } catch (err) {
+    // Ignore
   }
 }
 
@@ -496,6 +615,31 @@ downloadBtn.addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
+if (scd30RenderBtn) {
+  scd30RenderBtn.addEventListener("click", async () => {
+    try {
+      await fetch("/scd30/render", { method: "POST" });
+    } catch (err) {
+      // Ignore
+    }
+  });
+}
+
+if (scd30RefreshBtn) {
+  scd30RefreshBtn.addEventListener("click", async () => {
+    await refreshScd30Graph();
+    await fetchScd30Latest();
+  });
+}
+
+if (scd30ApplyAutoBtn) {
+  scd30ApplyAutoBtn.addEventListener("click", async () => {
+    await applyScd30Auto();
+  });
+}
+
 loadHeatshrinkWasm();
 updateGreenBoostLabel();
 scheduleRender();
+refreshScd30Graph();
+fetchScd30Latest();

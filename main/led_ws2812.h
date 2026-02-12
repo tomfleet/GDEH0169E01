@@ -11,3 +11,4 @@ void ws2812_init(void);
 void ws2812_set_pixel(ws2812_strip_t *strip, int index, uint8_t r, uint8_t g, uint8_t b);
 void ws2812_clear(ws2812_strip_t *strip);
 void ws2812_show(ws2812_strip_t *strip);
+void ws2812_refresh(void);

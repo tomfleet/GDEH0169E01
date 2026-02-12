@@ -1,6 +1,7 @@
 #include "image_upload.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_check.h"
 #include "esp_event.h"
@@ -12,9 +13,12 @@
 #include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "heatshrink_decoder.h"
+#include "config.h"
 #include "scd30_app.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
 
@@ -58,6 +62,15 @@ static void notify_status(image_upload_status_t status)
     if (s_status_cb) {
         s_status_cb(status, s_status_ctx);
     }
+}
+
+static void *alloc_upload_buffer(size_t size)
+{
+    void *buf = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        buf = malloc(size);
+    }
+    return buf;
 }
 
 static bool decode_rle_sp6_nibbles(const uint8_t *input, size_t input_len,
@@ -189,9 +202,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         notify_status(IMAGE_UPLOAD_STATUS_CONNECTING);
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "WiFi connected, starting DHCP client");
+        if (s_sta_netif) {
+            esp_err_t dhcp_ret = esp_netif_dhcpc_start(s_sta_netif);
+            if (dhcp_ret != ESP_OK && dhcp_ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "DHCP client start failed: %s", esp_err_to_name(dhcp_ret));
+            }
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnect reason: %u", event->reason);
+        if (s_sta_netif) {
+            esp_netif_dhcpc_stop(s_sta_netif);
+        }
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         if (s_retry_num < WIFI_MAXIMUM_RETRY) {
             if (s_retry_timer) {
                 esp_timer_stop(s_retry_timer);
@@ -512,6 +537,105 @@ static esp_err_t handle_scd30_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t handle_scd30_history_get(httpd_req_t *req)
+{
+    scd30_history_point_t points[SCD30_HISTORY_MAX_SAMPLES];
+    scd30_minmax_t minmax;
+    size_t count = scd30_get_history(points, SCD30_HISTORY_MAX_SAMPLES, &minmax);
+    if (count == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No data");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{");
+
+    char header[192];
+    int len = snprintf(header, sizeof(header),
+                       "\"count\":%u,\"window_sec\":%u,",
+                       (unsigned)count, (unsigned)SCD30_HISTORY_WINDOW_SEC);
+    if (len < 0) {
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr_chunk(req, header);
+
+    len = snprintf(header, sizeof(header),
+                   "\"minmax\":{\"co2_min\":%.2f,\"co2_max\":%.2f,"
+                   "\"temp_min\":%.2f,\"temp_max\":%.2f,"
+                   "\"rh_min\":%.2f,\"rh_max\":%.2f},\"points\":[",
+                   minmax.co2_min, minmax.co2_max,
+                   minmax.temperature_min, minmax.temperature_max,
+                   minmax.humidity_min, minmax.humidity_max);
+    if (len < 0) {
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr_chunk(req, header);
+
+    for (size_t i = 0; i < count; i++) {
+        char item[128];
+        len = snprintf(item, sizeof(item),
+                       "%s{\"age_ms\":%u,\"co2\":%.2f,\"t\":%.2f,\"rh\":%.2f}",
+                       (i == 0) ? "" : ",",
+                       (unsigned)points[i].age_ms,
+                       points[i].co2_ppm,
+                       points[i].temperature_c,
+                       points[i].humidity_rh);
+        if (len < 0) {
+            httpd_resp_sendstr_chunk(req, NULL);
+            return ESP_FAIL;
+        }
+        httpd_resp_sendstr_chunk(req, item);
+    }
+
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+static esp_err_t handle_scd30_render_post(httpd_req_t *req)
+{
+    (void)req;
+    scd30_render_graph_now();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t handle_scd30_auto_post(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > 128) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        return ESP_FAIL;
+    }
+
+    char body[129];
+    int received = httpd_req_recv(req, body, req->content_len);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Read failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    bool enabled = false;
+    uint32_t interval_sec = SCD30_DISPLAY_INTERVAL_SEC;
+    char *enabled_str = strstr(body, "enabled=");
+    if (enabled_str) {
+        enabled = atoi(enabled_str + 8) != 0;
+    }
+    char *interval_str = strstr(body, "interval=");
+    if (!interval_str) {
+        interval_str = strstr(body, "interval_sec=");
+    }
+    if (interval_str) {
+        interval_sec = (uint32_t)atoi(interval_str + (interval_str[8] == '=' ? 9 : 13));
+    }
+
+    scd30_set_auto_render(enabled, interval_sec);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t handle_heatshrink_wasm(httpd_req_t *req)
 {
     return send_spiffs_file(req, "/spiffs/heatshrink.wasm", "application/wasm");
@@ -527,7 +651,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
     }
 
     size_t input_len = (size_t)req->content_len;
-    uint8_t *input = malloc(input_len);
+    uint8_t *input = alloc_upload_buffer(input_len);
     if (!input) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         notify_status(IMAGE_UPLOAD_STATUS_IDLE);
@@ -574,7 +698,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        decoded = malloc(s_expected_size);
+        decoded = alloc_upload_buffer(s_expected_size);
         if (!decoded) {
             free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -607,7 +731,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        decoded = malloc(s_expected_size);
+        decoded = alloc_upload_buffer(s_expected_size);
         if (!decoded) {
             free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
@@ -658,7 +782,12 @@ static esp_err_t handle_image_post(httpd_req_t *req)
     fclose(file);
 
     if (s_handler) {
-        s_handler(raw, raw_len);
+        if (scd30_display_begin(60000)) {
+            s_handler(raw, raw_len);
+            scd30_display_end();
+        } else {
+            ESP_LOGW(TAG, "Power domain busy, skipping display update");
+        }
     }
 
     free(decoded);
@@ -671,7 +800,8 @@ static esp_err_t handle_image_post(httpd_req_t *req)
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;
+    config.stack_size = 24576;
+    config.max_uri_handlers = 16;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -727,6 +857,30 @@ static httpd_handle_t start_webserver(void)
     };
     httpd_register_uri_handler(server, &scd30);
 
+    httpd_uri_t scd30_history = {
+        .uri = "/scd30/history",
+        .method = HTTP_GET,
+        .handler = handle_scd30_history_get,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &scd30_history);
+
+    httpd_uri_t scd30_render = {
+        .uri = "/scd30/render",
+        .method = HTTP_POST,
+        .handler = handle_scd30_render_post,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &scd30_render);
+
+    httpd_uri_t scd30_auto = {
+        .uri = "/scd30/auto",
+        .method = HTTP_POST,
+        .handler = handle_scd30_auto_post,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &scd30_auto);
+
     return server;
 }
 
@@ -735,6 +889,11 @@ void image_upload_start(image_upload_handler_t handler, size_t expected_size)
     s_handler = handler;
     s_expected_size = expected_size;
     notify_status(IMAGE_UPLOAD_STATUS_BOOT);
+
+    if (WIFI_STARTUP_DELAY_MS > 0) {
+        ESP_LOGI(TAG, "Delaying WiFi start by %u ms", (unsigned)WIFI_STARTUP_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(WIFI_STARTUP_DELAY_MS));
+    }
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

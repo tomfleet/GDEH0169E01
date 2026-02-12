@@ -11,6 +11,8 @@ static const char *TAG = "ws2812";
 
 static rmt_channel_handle_t s_rmt_chan;
 static rmt_encoder_handle_t s_rmt_encoder;
+static ws2812_strip_t s_last_strip;
+static bool s_last_valid;
 
 void ws2812_init(void)
 {
@@ -97,5 +99,15 @@ void ws2812_show(ws2812_strip_t *strip)
         ESP_LOGE(TAG, "RMT wait failed: 0x%x", err);
         return;
     }
+    memcpy(&s_last_strip, strip, sizeof(s_last_strip));
+    s_last_valid = true;
     vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+void ws2812_refresh(void)
+{
+    if (!s_last_valid) {
+        return;
+    }
+    ws2812_show(&s_last_strip);
 }
