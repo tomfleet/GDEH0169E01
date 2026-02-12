@@ -521,8 +521,9 @@ static esp_err_t handle_image_post(httpd_req_t *req)
 
         raw = decoded;
         raw_len = s_expected_size;
-        ESP_LOGI(TAG, "Image received (heatshrink %u bytes -> raw %u bytes)",
-                 (unsigned)input_len, (unsigned)raw_len);
+        ESP_LOGI(TAG, "Image received (heatshrink %u bytes -> raw %u bytes, ratio %.2fx)",
+             (unsigned)input_len, (unsigned)raw_len,
+             raw_len ? ((double)input_len / (double)raw_len) : 0.0);
     } else if (has_rle_header) {
         uint32_t decoded_size = (uint32_t)input[4] |
                                 ((uint32_t)input[5] << 8) |
@@ -550,8 +551,9 @@ static esp_err_t handle_image_post(httpd_req_t *req)
 
         raw = decoded;
         raw_len = s_expected_size;
-        ESP_LOGI(TAG, "Image received (rle %u bytes -> raw %u bytes)",
-                 (unsigned)input_len, (unsigned)raw_len);
+        ESP_LOGI(TAG, "Image received (rle %u bytes -> raw %u bytes, ratio %.2fx)",
+                 (unsigned)input_len, (unsigned)raw_len,
+                 raw_len ? ((double)input_len / (double)raw_len) : 0.0);
     } else if (input_len != s_expected_size) {
         free(input);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");

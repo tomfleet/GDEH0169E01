@@ -45,6 +45,11 @@ function setStatus(text) {
   statusEl.textContent = text;
 }
 
+function formatRatio(compressed, raw) {
+  if (!compressed || !raw) return "n/a";
+  return (compressed / raw).toFixed(2) + "x";
+}
+
 function fitImage() {
   if (!sourceImage) return;
   const canvasSize = cropCanvas.width;
@@ -405,11 +410,11 @@ convertBtn.addEventListener("click", async () => {
   lastRleBytes = candidateRle.length < lastRawBytes.length ? candidateRle : null;
 
   if (lastHeatshrinkBytes && lastHeatshrinkBytes.length < lastRawBytes.length) {
-    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, heatshrink ${lastHeatshrinkBytes.length} bytes)`);
+    setStatus(`Converted: raw ${lastRawBytes.length}B, heatshrink ${lastHeatshrinkBytes.length}B (${formatRatio(lastHeatshrinkBytes.length, lastRawBytes.length)})`);
   } else if (lastRleBytes) {
-    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, rle ${lastRleBytes.length} bytes)`);
+    setStatus(`Converted: raw ${lastRawBytes.length}B, rle ${lastRleBytes.length}B (${formatRatio(lastRleBytes.length, lastRawBytes.length)})`);
   } else {
-    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, no compression)`);
+    setStatus(`Converted: raw ${lastRawBytes.length}B, no compression`);
   }
 });
 
@@ -428,6 +433,8 @@ uploadBtn.addEventListener("click", async () => {
       (lastHeatshrinkBytes && lastHeatshrinkBytes.length < lastRawBytes.length)
         ? lastHeatshrinkBytes
         : (lastRleBytes || lastRawBytes);
+    const ratio = formatRatio(payload.length, lastRawBytes.length);
+    console.log("upload", { raw: lastRawBytes.length, payload: payload.length, ratio });
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
@@ -436,7 +443,7 @@ uploadBtn.addEventListener("click", async () => {
     if (!response.ok) {
       throw new Error(`Upload failed: ${response.status}`);
     }
-    setStatus("Upload complete");
+    setStatus(`Upload complete: ${payload.length}B (${ratio})`);
   } catch (err) {
     setStatus(`Upload failed: ${err.message}`);
   }
