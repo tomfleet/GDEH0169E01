@@ -53,8 +53,7 @@ function drawCrop() {
   ctx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
 
   if (!sourceImage) return;
-  const rotationDeg = (userRotationDeg + PANEL_ROTATION_DEG) % 360;
-  const angle = (rotationDeg * Math.PI) / 180;
+  const angle = (userRotationDeg * Math.PI) / 180;
   const center = cropCanvas.width / 2;
   ctx.translate(center + offset.x, center + offset.y);
   ctx.rotate(angle);
@@ -182,11 +181,18 @@ function packSp6() {
   const width = previewCanvas.width;
   const height = previewCanvas.height;
   const out = new Uint8Array((width * height) / 2);
+  const rotatePanel = ((PANEL_ROTATION_DEG % 360) + 360) % 360;
 
   let outIndex = 0;
   for (let y = height - 1; y >= 0; y--) {
     for (let x = width - 1; x >= 0; x--) {
-      const idx = (y * width + x) * 4;
+      let srcX = x;
+      let srcY = y;
+      if (rotatePanel === 180) {
+        srcX = width - 1 - x;
+        srcY = height - 1 - y;
+      }
+      const idx = (srcY * width + srcX) * 4;
       const color = nearestColor(data[idx], data[idx + 1], data[idx + 2]);
       if ((x & 1) === 0) {
         out[outIndex] = color.code << 4;
@@ -283,8 +289,8 @@ uploadBtn.addEventListener("click", async () => {
 
 downloadBtn.addEventListener("click", () => {
   if (!lastRawBytes) {
-    renderPreview();
-    lastRawBytes = packSp6();
+    setStatus("Convert first");
+    return;
   }
   const blob = new Blob([lastRawBytes], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);

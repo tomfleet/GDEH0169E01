@@ -190,42 +190,42 @@ void epd_bus_reset(void)
 void epd_bus_write_cmd(epd_ms_target_t target, uint8_t cmd)
 {
     select_target(target);
-    delay_us(10);
+    delay_us(2);
     ndc_low();
     delay_us(1);
     spi_write_byte(cmd);
     delay_us(1);
-    delay_us(10);
+    delay_us(2);
     csb_high();
     csb2_high();
-    delay_us(10);
+    delay_us(2);
 }
 
 void epd_bus_write_data(epd_ms_target_t target, uint8_t data)
 {
     select_target(target);
-    delay_us(10);
+    delay_us(2);
     ndc_high();
     delay_us(1);
     spi_write_byte(data);
     delay_us(1);
-    delay_us(10);
+    delay_us(2);
     csb_high();
     csb2_high();
-    delay_us(10);
+    delay_us(2);
 }
 
 uint8_t epd_bus_read_data(epd_ms_target_t target)
 {
     select_target(target);
-    delay_us(10);
+    delay_us(2);
     ndc_high();
     delay_us(1);
     uint8_t temp = spi_read_byte();
-    delay_us(10);
+    delay_us(2);
     csb_high();
     csb2_high();
-    delay_us(10);
+    delay_us(2);
     return temp;
 }
 

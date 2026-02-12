@@ -6,6 +6,8 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_spiffs.h"
 #include "esp_wifi.h"
@@ -26,6 +28,7 @@ static bool s_event_loop_ready;
 static bool s_handlers_registered;
 static bool s_wifi_started;
 static esp_netif_t *s_sta_netif;
+static esp_netif_t *s_ap_netif;
 
 static image_upload_handler_t s_handler;
 static size_t s_expected_size;
@@ -49,6 +52,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Open http://" IPSTR "/", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
@@ -56,7 +60,39 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-static esp_err_t wifi_init_sta(void)
+static bool build_sta_config(wifi_config_t *wifi_config)
+{
+    memset(wifi_config, 0, sizeof(*wifi_config));
+    strlcpy((char *)wifi_config->sta.ssid, CONFIG_WIFI_SSID,
+            sizeof(wifi_config->sta.ssid));
+    strlcpy((char *)wifi_config->sta.password, CONFIG_WIFI_PASSWORD,
+            sizeof(wifi_config->sta.password));
+    wifi_config->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config->sta.sae_pwe_h2e = WPA3_SAE_PWE_UNSPECIFIED;
+    wifi_config->sta.pmf_cfg.capable = true;
+    wifi_config->sta.pmf_cfg.required = false;
+
+    if (strlen((const char *)wifi_config->sta.ssid) == 0) {
+        return false;
+    }
+
+    if (strlen((const char *)wifi_config->sta.password) == 0) {
+        wifi_config->sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+
+    return true;
+}
+
+static void generate_ap_credentials(char *ssid, size_t ssid_len, char *pass,
+                                    size_t pass_len)
+{
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(ssid, ssid_len, "epd-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    snprintf(pass, pass_len, "epd-%02x%02x%02x%02x", mac[2], mac[3], mac[4], mac[5]);
+}
+
+static esp_err_t wifi_init_sta(wifi_config_t *wifi_config)
 {
     if (!s_wifi_event_group) {
         s_wifi_event_group = xEventGroupCreate();
@@ -99,36 +135,15 @@ static esp_err_t wifi_init_sta(void)
         }
     }
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = CONFIG_WIFI_SSID,
-            .password = CONFIG_WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_WPA3_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
-    };
-
-    ESP_LOGI(TAG, "WiFi SSID: %s", (const char *)wifi_config.sta.ssid);
-    ESP_LOGI(TAG, "WiFi password: %s", (const char *)wifi_config.sta.password);
-
-    if (strlen((const char *)wifi_config.sta.ssid) == 0) {
-        ESP_LOGE(TAG, "WiFi SSID is empty. Configure CONFIG_WIFI_SSID");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (strlen((const char *)wifi_config.sta.password) == 0) {
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    }
+    ESP_LOGI(TAG, "WiFi SSID: %s", (const char *)wifi_config->sta.ssid);
+    ESP_LOGI(TAG, "WiFi password: %s", (const char *)wifi_config->sta.password);
+    ESP_LOGI(TAG, "Connecting to %s", (const char *)wifi_config->sta.ssid);
 
     if (!s_wifi_started) {
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode failed");
         ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG,
                             "set storage failed");
-        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG,
+        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, wifi_config), TAG,
                             "set config failed");
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
         ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "set power save failed");
@@ -144,11 +159,6 @@ static esp_err_t wifi_init_sta(void)
     }
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    esp_err_t connect_ret = esp_wifi_connect();
-    if (connect_ret != ESP_OK && connect_ret != ESP_ERR_WIFI_CONN) {
-        ESP_LOGE(TAG, "wifi connect failed: %s", esp_err_to_name(connect_ret));
-        return connect_ret;
-    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -163,6 +173,76 @@ static esp_err_t wifi_init_sta(void)
 
     ESP_LOGE(TAG, "Failed to connect to AP");
     return ESP_FAIL;
+}
+
+static esp_err_t wifi_init_ap(void)
+{
+    if (!s_wifi_event_group) {
+        s_wifi_event_group = xEventGroupCreate();
+    }
+
+    if (!s_netif_ready) {
+        esp_err_t netif_ret = esp_netif_init();
+        if (netif_ret != ESP_OK && netif_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(netif_ret, TAG, "netif init failed");
+        }
+        s_netif_ready = true;
+    }
+
+    if (!s_event_loop_ready) {
+        esp_err_t loop_ret = esp_event_loop_create_default();
+        if (loop_ret != ESP_OK && loop_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(loop_ret, TAG, "event loop init failed");
+        }
+        s_event_loop_ready = true;
+    }
+
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
+    }
+
+    char ssid[32];
+    char pass[64];
+    generate_ap_credentials(ssid, sizeof(ssid), pass, sizeof(pass));
+
+    wifi_config_t ap_config = {0};
+    strlcpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid));
+    ap_config.ap.ssid_len = strlen(ssid);
+    strlcpy((char *)ap_config.ap.password, pass, sizeof(ap_config.ap.password));
+    ap_config.ap.channel = 1;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    if (strlen(pass) < 8) {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "set mode failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG,
+                            "set storage failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), TAG,
+                            "set config failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+        s_wifi_started = true;
+    }
+
+    ESP_LOGW(TAG, "No WiFi creds. SoftAP started");
+    ESP_LOGI(TAG, "SoftAP SSID: %s", ssid);
+    ESP_LOGI(TAG, "SoftAP password: %s", pass);
+
+    if (s_ap_netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
+            ESP_LOGI(TAG, "Open http://" IPSTR "/", IP2STR(&ip_info.ip));
+        }
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t spiffs_init(void)
@@ -343,7 +423,10 @@ void image_upload_start(image_upload_handler_t handler, size_t expected_size)
 
     ESP_ERROR_CHECK(spiffs_init());
 
-    esp_err_t wifi_ret = wifi_init_sta();
+    wifi_config_t sta_config;
+    bool has_sta = build_sta_config(&sta_config);
+
+    esp_err_t wifi_ret = has_sta ? wifi_init_sta(&sta_config) : wifi_init_ap();
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi init failed: %s", esp_err_to_name(wifi_ret));
         return;
