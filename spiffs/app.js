@@ -3,6 +3,8 @@ const previewCanvas = document.getElementById("previewCanvas");
 const fileInput = document.getElementById("fileInput");
 const zoomInput = document.getElementById("zoom");
 const rotationInput = document.getElementById("rotation");
+const greenBoostInput = document.getElementById("greenBoost");
+const greenBoostValue = document.getElementById("greenBoostValue");
 const ditherInput = document.getElementById("dither");
 const roundMaskInput = document.getElementById("roundMask");
 const convertBtn = document.getElementById("convertBtn");
@@ -36,6 +38,7 @@ let lastRawBytes = null;
 let lastRleBytes = null;
 let lastHeatshrinkBytes = null;
 let userRotationDeg = 0;
+let greenBoost = Number(greenBoostInput?.value || 1.2);
 
 let heatshrinkReady = null;
 let heatshrinkExports = null;
@@ -48,6 +51,12 @@ function setStatus(text) {
 function formatRatio(compressed, raw) {
   if (!compressed || !raw) return "n/a";
   return (compressed / raw).toFixed(2) + "x";
+}
+
+function updateGreenBoostLabel() {
+  if (greenBoostValue) {
+    greenBoostValue.textContent = `${greenBoost.toFixed(2)}x`;
+  }
 }
 
 function fitImage() {
@@ -193,6 +202,13 @@ function nearestColor(r, g, b) {
   return best;
 }
 
+function applyGain(r, g, b) {
+  const gr = Math.max(0, Math.min(255, r));
+  const gg = Math.max(0, Math.min(255, g * greenBoost));
+  const gb = Math.max(0, Math.min(255, b));
+  return [gr, gg, gb];
+}
+
 function renderPreview() {
   const ctx = previewCanvas.getContext("2d");
   const cropCtx = cropCanvas.getContext("2d");
@@ -203,7 +219,8 @@ function renderPreview() {
     floydSteinberg(data, cropCanvas.width, cropCanvas.height);
   } else {
     for (let i = 0; i < data.length; i += 4) {
-      const color = nearestColor(data[i], data[i + 1], data[i + 2]);
+      const [r, g, b] = applyGain(data[i], data[i + 1], data[i + 2]);
+      const color = nearestColor(r, g, b);
       data[i] = color.rgb[0];
       data[i + 1] = color.rgb[1];
       data[i + 2] = color.rgb[2];
@@ -238,7 +255,13 @@ function applyRoundMask(data, width, height) {
 
 function floydSteinberg(data, width, height) {
   const buffer = new Float32Array(data.length);
-  for (let i = 0; i < data.length; i++) buffer[i] = data[i];
+  for (let i = 0; i < data.length; i += 4) {
+    const [r, g, b] = applyGain(data[i], data[i + 1], data[i + 2]);
+    buffer[i] = r;
+    buffer[i + 1] = g;
+    buffer[i + 2] = b;
+    buffer[i + 3] = data[i + 3];
+  }
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -375,6 +398,14 @@ rotationInput.addEventListener("change", () => {
   scheduleRender();
 });
 
+if (greenBoostInput) {
+  greenBoostInput.addEventListener("input", () => {
+    greenBoost = Number(greenBoostInput.value);
+    updateGreenBoostLabel();
+    scheduleRender();
+  });
+}
+
 cropCanvas.addEventListener("pointerdown", (event) => {
   isDragging = true;
   dragStart = { x: event.clientX - offset.x, y: event.clientY - offset.y };
@@ -466,4 +497,5 @@ downloadBtn.addEventListener("click", () => {
 });
 
 loadHeatshrinkWasm();
+updateGreenBoostLabel();
 scheduleRender();

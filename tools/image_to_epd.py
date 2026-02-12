@@ -24,8 +24,17 @@ PALETTE = [
 ]
 
 
-def nearest_color(rgb: Tuple[int, int, int]) -> int:
+def apply_green_boost(rgb: Tuple[float, float, float], green_boost: float) -> Tuple[float, float, float]:
     r, g, b = rgb
+    g = g * green_boost
+    r = min(255.0, max(0.0, r))
+    g = min(255.0, max(0.0, g))
+    b = min(255.0, max(0.0, b))
+    return r, g, b
+
+
+def nearest_color(rgb: Tuple[int, int, int], green_boost: float) -> int:
+    r, g, b = apply_green_boost(rgb, green_boost)
     best_code = 0
     best_dist = None
     for _, (pr, pg, pb), code in PALETTE:
@@ -39,8 +48,8 @@ def nearest_color(rgb: Tuple[int, int, int]) -> int:
     return best_code
 
 
-def nearest_color_rgb(rgb: Tuple[float, float, float]) -> Tuple[Tuple[int, int, int], int]:
-    r, g, b = rgb
+def nearest_color_rgb(rgb: Tuple[float, float, float], green_boost: float) -> Tuple[Tuple[int, int, int], int]:
+    r, g, b = apply_green_boost(rgb, green_boost)
     best_code = 0
     best_dist = None
     best_rgb = (0, 0, 0)
@@ -56,11 +65,11 @@ def nearest_color_rgb(rgb: Tuple[float, float, float]) -> Tuple[Tuple[int, int, 
     return best_rgb, best_code
 
 
-def dither_floyd_steinberg(img: Image.Image) -> List[List[Tuple[int, int, int]]]:
+def dither_floyd_steinberg(img: Image.Image, green_boost: float) -> List[List[Tuple[int, int, int]]]:
     width, height = img.size
     pixels = img.load()
     buf: List[List[Tuple[float, float, float]]] = [
-        [tuple(map(float, pixels[x, y])) for x in range(width)]
+        [apply_green_boost(tuple(map(float, pixels[x, y])), green_boost) for x in range(width)]
         for y in range(height)
     ]
     out: List[List[Tuple[int, int, int]]] = [
@@ -70,7 +79,7 @@ def dither_floyd_steinberg(img: Image.Image) -> List[List[Tuple[int, int, int]]]
     for y in range(height):
         for x in range(width):
             old = buf[y][x]
-            new_rgb, _ = nearest_color_rgb(old)
+            new_rgb, _ = nearest_color_rgb(old, green_boost)
             out[y][x] = new_rgb
             err_r = old[0] - new_rgb[0]
             err_g = old[1] - new_rgb[1]
@@ -108,13 +117,13 @@ def apply_round_mask(img: Image.Image) -> None:
                 pixels[x, y] = (255, 255, 255)
 
 
-def image_to_bytes(img: Image.Image, dither: bool, packing: str) -> bytearray:
+def image_to_bytes(img: Image.Image, dither: bool, packing: str, green_boost: float) -> bytearray:
     size = img.size[0]
     if size % 2 != 0:
         raise ValueError("Image size must be even")
     half = size // 2
     if dither:
-        dithered = dither_floyd_steinberg(img)
+        dithered = dither_floyd_steinberg(img, green_boost)
     else:
         pixels = img.load()
     out = bytearray()
@@ -123,9 +132,9 @@ def image_to_bytes(img: Image.Image, dither: bool, packing: str) -> bytearray:
             pending = 0
             for x in range(size - 1, -1, -1):
                 if dither:
-                    value = nearest_color(dithered[y][x])
+                    value = nearest_color(dithered[y][x], green_boost)
                 else:
-                    value = nearest_color(pixels[x, y])
+                    value = nearest_color(pixels[x, y], green_boost)
                 if (x & 1) == 0:
                     pending = value
                 else:
@@ -135,11 +144,11 @@ def image_to_bytes(img: Image.Image, dither: bool, packing: str) -> bytearray:
     for x in range(size):
         for y in range(half):
             if dither:
-                upper = nearest_color(dithered[y][x])
-                lower = nearest_color(dithered[y + half][x])
+                upper = nearest_color(dithered[y][x], green_boost)
+                lower = nearest_color(dithered[y + half][x], green_boost)
             else:
-                upper = nearest_color(pixels[x, y])
-                lower = nearest_color(pixels[x, y + half])
+                upper = nearest_color(pixels[x, y], green_boost)
+                lower = nearest_color(pixels[x, y + half], green_boost)
             if packing == "byte":
                 out.append((upper << 4) | upper)
                 out.append((lower << 4) | lower)
@@ -191,6 +200,12 @@ def main() -> int:
         help="Rotate image clockwise (degrees)",
     )
     parser.add_argument(
+        "--green-boost",
+        type=float,
+        default=1.2,
+        help="Boost green channel before quantization (1.0 = no change)",
+    )
+    parser.add_argument(
         "--packing",
         choices=["nibble", "byte", "sp6"],
         default="sp6",
@@ -225,7 +240,8 @@ def main() -> int:
     if args.round_mask:
         apply_round_mask(img)
 
-    data = image_to_bytes(img, dither=args.dither == "fs", packing=args.packing)
+    data = image_to_bytes(img, dither=args.dither == "fs", packing=args.packing,
+                          green_boost=args.green_boost)
     expected = args.size * args.size // 2
     if args.packing == "byte":
         expected = args.size * args.size

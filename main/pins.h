@@ -26,4 +26,11 @@ Adapter board Pinout
 #define PIN_MS 42
 #define PIN_CSB2 1
 
+#define NEOPIXEL_PWR_PIN 17
+#define NEOPIXEL_DATA_PIN 18
+#define NEOPIXEL_NUM 1  
+
+#define SCD30_SDA_PIN 8
+#define SCD30_SCL_PIN 9
+
 #endif // PINS_H

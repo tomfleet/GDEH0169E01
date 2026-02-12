@@ -46,6 +46,12 @@ def main() -> int:
         help="Rotate image clockwise (degrees)",
     )
     parser.add_argument(
+        "--green-boost",
+        type=float,
+        default=1.2,
+        help="Boost green channel before quantization (1.0 = no change)",
+    )
+    parser.add_argument(
         "--packing",
         choices=["sp6", "nibble", "byte"],
         default="sp6",
@@ -93,6 +99,8 @@ def main() -> int:
         cmd.append("--no-flip-y")
     if args.rotate:
         cmd.extend(["--rotate", str(args.rotate)])
+    if args.green_boost != 1.2:
+        cmd.extend(["--green-boost", str(args.green_boost)])
 
     run(cmd)
 

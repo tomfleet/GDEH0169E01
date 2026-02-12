@@ -10,8 +10,10 @@
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "heatshrink_decoder.h"
+#include "scd30_app.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
@@ -21,6 +23,7 @@ static const char *TAG = "image_upload";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 #define WIFI_MAXIMUM_RETRY 10
+#define WIFI_RETRY_DELAY_MS 5000
 
 #define RLE_MAGIC_0 0x53
 #define RLE_MAGIC_1 0x50
@@ -43,9 +46,19 @@ static bool s_handlers_registered;
 static bool s_wifi_started;
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
+static esp_timer_handle_t s_retry_timer;
 
 static image_upload_handler_t s_handler;
 static size_t s_expected_size;
+static image_upload_status_cb_t s_status_cb;
+static void *s_status_ctx;
+
+static void notify_status(image_upload_status_t status)
+{
+    if (s_status_cb) {
+        s_status_cb(status, s_status_ctx);
+    }
+}
 
 static bool decode_rle_sp6_nibbles(const uint8_t *input, size_t input_len,
                                    uint8_t *output, size_t output_len)
@@ -174,16 +187,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                                void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        notify_status(IMAGE_UPLOAD_STATUS_CONNECTING);
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnect reason: %u", event->reason);
         if (s_retry_num < WIFI_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying WiFi connection");
+            if (s_retry_timer) {
+                esp_timer_stop(s_retry_timer);
+                esp_timer_start_once(s_retry_timer, WIFI_RETRY_DELAY_MS * 1000ULL);
+            }
+            ESP_LOGI(TAG, "Retrying WiFi connection in %u ms", WIFI_RETRY_DELAY_MS);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            notify_status(IMAGE_UPLOAD_STATUS_WIFI_FAILED);
         }
         ESP_LOGW(TAG, "Failed to connect to the AP");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -191,10 +208,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Open http://" IPSTR "/", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        notify_status(IMAGE_UPLOAD_STATUS_CONNECTED);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
         ESP_LOGW(TAG, "Lost IP address");
     }
+}
+
+static void retry_timer_cb(void *arg)
+{
+    (void)arg;
+    s_retry_num++;
+    notify_status(IMAGE_UPLOAD_STATUS_CONNECTING);
+    esp_wifi_connect();
 }
 
 static bool build_sta_config(wifi_config_t *wifi_config)
@@ -255,6 +281,17 @@ static esp_err_t wifi_init_sta(wifi_config_t *wifi_config)
         s_sta_netif = esp_netif_create_default_wifi_sta();
     }
 
+    if (!s_retry_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback = retry_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wifi_retry",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &s_retry_timer), TAG,
+                            "retry timer create failed");
+    }
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     if (!s_wifi_started) {
         ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
@@ -305,10 +342,12 @@ static esp_err_t wifi_init_sta(wifi_config_t *wifi_config)
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_OK;
     }
 
     ESP_LOGE(TAG, "Failed to connect to AP");
+    notify_status(IMAGE_UPLOAD_STATUS_WIFI_FAILED);
     return ESP_FAIL;
 }
 
@@ -371,6 +410,7 @@ static esp_err_t wifi_init_ap(void)
     ESP_LOGW(TAG, "No WiFi creds. SoftAP started");
     ESP_LOGI(TAG, "SoftAP SSID: %s", ssid);
     ESP_LOGI(TAG, "SoftAP password: %s", pass);
+    notify_status(IMAGE_UPLOAD_STATUS_CONNECTED);
 
     if (s_ap_netif) {
         esp_netif_ip_info_t ip_info;
@@ -448,6 +488,30 @@ static esp_err_t handle_styles_css(httpd_req_t *req)
     return send_spiffs_file(req, "/spiffs/styles.css", "text/css");
 }
 
+static esp_err_t handle_scd30_get(httpd_req_t *req)
+{
+    scd30_reading_t reading;
+    if (!scd30_get_latest(&reading)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "No data");
+        return ESP_FAIL;
+    }
+
+    char body[192];
+    int len = snprintf(body, sizeof(body),
+                       "{\"co2_ppm\":%.2f,\"temperature_c\":%.2f,"
+                       "\"humidity_rh\":%.2f,\"age_ms\":%u}",
+                       reading.co2_ppm, reading.temperature_c,
+                       reading.humidity_rh, (unsigned)reading.age_ms);
+    if (len < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Format failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, len);
+    return ESP_OK;
+}
+
 static esp_err_t handle_heatshrink_wasm(httpd_req_t *req)
 {
     return send_spiffs_file(req, "/spiffs/heatshrink.wasm", "application/wasm");
@@ -455,8 +519,10 @@ static esp_err_t handle_heatshrink_wasm(httpd_req_t *req)
 
 static esp_err_t handle_image_post(httpd_req_t *req)
 {
+    notify_status(IMAGE_UPLOAD_STATUS_UPLOADING);
     if (req->content_len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_FAIL;
     }
 
@@ -464,6 +530,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
     uint8_t *input = malloc(input_len);
     if (!input) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_FAIL;
     }
 
@@ -473,6 +540,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         if (chunk <= 0) {
             free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
         received += (size_t)chunk;
@@ -502,6 +570,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         if (decoded_size != s_expected_size) {
             free(input);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid heatshrink size");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -509,6 +578,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         if (!decoded) {
             free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -516,6 +586,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
             free(decoded);
             free(input);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Heatshrink decode failed");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -532,6 +603,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         if (decoded_size != s_expected_size) {
             free(input);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid RLE size");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -539,6 +611,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         if (!decoded) {
             free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -546,6 +619,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
             free(decoded);
             free(input);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "RLE decode failed");
+            notify_status(IMAGE_UPLOAD_STATUS_IDLE);
             return ESP_FAIL;
         }
 
@@ -557,6 +631,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
     } else if (input_len != s_expected_size) {
         free(input);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_FAIL;
     } else {
         ESP_LOGI(TAG, "Image received (raw %u bytes)", (unsigned)raw_len);
@@ -567,6 +642,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         free(decoded);
         free(input);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_FAIL;
     }
 
@@ -575,6 +651,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
         free(decoded);
         free(input);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
+        notify_status(IMAGE_UPLOAD_STATUS_IDLE);
         return ESP_FAIL;
     }
 
@@ -587,6 +664,7 @@ static esp_err_t handle_image_post(httpd_req_t *req)
     free(decoded);
     free(input);
     httpd_resp_sendstr(req, "OK");
+    notify_status(IMAGE_UPLOAD_STATUS_IDLE);
     return ESP_OK;
 }
 
@@ -641,6 +719,14 @@ static httpd_handle_t start_webserver(void)
     };
     httpd_register_uri_handler(server, &image);
 
+    httpd_uri_t scd30 = {
+        .uri = "/scd30",
+        .method = HTTP_GET,
+        .handler = handle_scd30_get,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &scd30);
+
     return server;
 }
 
@@ -648,6 +734,7 @@ void image_upload_start(image_upload_handler_t handler, size_t expected_size)
 {
     s_handler = handler;
     s_expected_size = expected_size;
+    notify_status(IMAGE_UPLOAD_STATUS_BOOT);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -668,4 +755,11 @@ void image_upload_start(image_upload_handler_t handler, size_t expected_size)
 
     start_webserver();
     ESP_LOGI(TAG, "HTTP server ready: POST /image");
+    notify_status(IMAGE_UPLOAD_STATUS_IDLE);
+}
+
+void image_upload_set_status_callback(image_upload_status_cb_t cb, void *ctx)
+{
+    s_status_cb = cb;
+    s_status_ctx = ctx;
 }
