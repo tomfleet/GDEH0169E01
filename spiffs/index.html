@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EPD Photo Uploader</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <div class="hero__text">
+          <p class="kicker">GDEH0169E01</p>
+          <h1>EPD Photo Uploader</h1>
+          <p class="subhead">
+            Crop, dither, and send 400x400 photos straight to your display.
+          </p>
+        </div>
+        <div class="hero__status" id="status">Idle</div>
+      </header>
+
+      <section class="panel">
+        <div class="panel__left">
+          <div class="canvas-wrap">
+            <canvas id="cropCanvas" width="400" height="400"></canvas>
+            <div class="canvas-label">Crop Area 400x400</div>
+          </div>
+          <div class="controls">
+            <label class="control">
+              <span>Image</span>
+              <input id="fileInput" type="file" accept="image/*" />
+            </label>
+            <label class="control">
+              <span>Zoom</span>
+              <input id="zoom" type="range" min="0.2" max="3" step="0.01" value="1" />
+            </label>
+            <label class="control">
+              <span>Rotation</span>
+              <select id="rotation">
+                <option value="0" selected>0</option>
+                <option value="90">90</option>
+                <option value="180">180</option>
+                <option value="270">270</option>
+              </select>
+            </label>
+            <div class="control row">
+              <label><input id="dither" type="checkbox" /> Dither</label>
+              <label><input id="roundMask" type="checkbox" /> Round mask</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel__right">
+          <div class="canvas-wrap">
+            <canvas id="previewCanvas" width="400" height="400"></canvas>
+            <div class="canvas-label">Preview (6 colors)</div>
+          </div>
+          <div class="controls">
+            <label class="control">
+              <span>Device URL</span>
+              <input id="deviceUrl" type="text" value="/image" />
+            </label>
+            <div class="control row">
+              <button id="convertBtn">Convert</button>
+              <button id="uploadBtn">Upload</button>
+            </div>
+            <div class="control row">
+              <button id="downloadBtn">Download .sp6</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

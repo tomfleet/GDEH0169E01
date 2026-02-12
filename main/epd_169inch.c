@@ -1,22 +1,13 @@
 #include "epd_169inch.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "esp_err.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
-#include "esp_timer.h"
 
-#include "pins.h"
-#include "imageme.h"
-#include "image2.h"
-#define MASTER_ONLY 0
-#define SLAVE_ONLY 1
-#define MASTER_SLAVE 2
+#include "epd_169inch_bus.h"
 
 #define TEMPTR_ON 0xFF
 #define TEMPTR_OFF 0x00
@@ -28,284 +19,24 @@
 #define BLUE 0x55
 #define GREEN 0x66
 
-#define PIC_HALF 0xFC
 #define PIC_A 0xFD
 #define STRIPE 0xFE
-#define IMAGE 0xFF
-
-#define EPD_SPI_HOST SPI2_HOST
-#define EPD_SPI_CLOCK_HZ 250000
 
 static const char *TAG = "epd_169";
 
 static uint8_t temptr_cur;
 static uint8_t otp_pwr[5];
-
-static spi_device_handle_t spi_handle;
-static bool spi_ready;
 static bool epd_ready;
-
-static inline void delay_us(uint32_t time_us)
-{
-    if (time_us > 0) {
-        esp_rom_delay_us(time_us);
-    }
-}
-
-static void delay_ms(uint32_t time_ms)
-{
-    if (time_ms == 0) {
-        return;
-    }
-
-    if (time_ms <= 2) {
-        esp_rom_delay_us(time_ms * 1000U);
-        return;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(time_ms));
-}
-
-static void delay_s(uint32_t time_s)
-{
-    if (time_s == 0) {
-        return;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(time_s * 1000U));
-}
-
-static inline void yield_if_needed(uint32_t *counter)
-{
-    (*counter)++;
-    if ((*counter % 2000U) == 0U) {
-        vTaskDelay(1);
-    }
-}
-
-static inline void nrst_high(void) { gpio_set_level(PIN_RES, 1); }
-static inline void nrst_low(void) { gpio_set_level(PIN_RES, 0); }
-static inline void ndc_high(void) { gpio_set_level(PIN_DC, 1); }
-static inline void ndc_low(void) { gpio_set_level(PIN_DC, 0); }
-static inline void csb_high(void) { gpio_set_level(PIN_CS, 1); }
-static inline void csb_low(void) { gpio_set_level(PIN_CS, 0); }
-static inline void csb2_high(void) { gpio_set_level(PIN_CSB2, 1); }
-static inline void csb2_low(void) { gpio_set_level(PIN_CSB2, 0); }
-static inline void ms_high(void) { gpio_set_level(PIN_MS, 1); }
-static inline void ms_low(void) { gpio_set_level(PIN_MS, 0); }
-
-static void spi_init(void)
-{
-    if (spi_ready) {
-        return;
-    }
-
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = PIN_SDA,
-        .miso_io_num = -1,
-        .sclk_io_num = PIN_SCL,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 0,
-    };
-
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = EPD_SPI_CLOCK_HZ,
-        .mode = 0,
-        .spics_io_num = -1,
-        .queue_size = 1,
-        .flags = SPI_DEVICE_3WIRE | SPI_DEVICE_HALFDUPLEX,
-    };
-
-    esp_err_t ret = spi_bus_initialize(EPD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_ERROR_CHECK(ret);
-    }
-
-    ESP_ERROR_CHECK(spi_bus_add_device(EPD_SPI_HOST, &devcfg, &spi_handle));
-    spi_ready = true;
-}
-
-static void spi_write_byte(uint8_t value)
-{
-    spi_transaction_t t = {
-        .length = 8,
-        .flags = SPI_TRANS_USE_TXDATA,
-    };
-    t.tx_data[0] = value;
-    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_handle, &t));
-}
-
-static uint8_t spi_read_byte(void)
-{
-    spi_transaction_t t = {
-        .length = 0,
-        .rxlength = 8,
-        .flags = SPI_TRANS_USE_RXDATA,
-    };
-    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_handle, &t));
-    return t.rx_data[0];
-}
-
-static void sys_init(void)
-{
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << PIN_RES) | (1ULL << PIN_DC) | (1ULL << PIN_CS) |
-                        (1ULL << PIN_CSB2) | (1ULL << PIN_MS),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-    };
-    gpio_config(&io_conf);
-
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << PIN_BUSY);
-    gpio_config(&io_conf);
-
-    nrst_high();
-    ndc_high();
-    csb_high();
-    csb2_high();
-    ms_high();
-
-    gpio_set_level(PIN_RES, 1);
-    gpio_set_level(PIN_DC, 1);
-    gpio_set_level(PIN_CS, 1);
-    gpio_set_level(PIN_CSB2, 1);
-    gpio_set_level(PIN_MS, 1);
-
-    spi_init();
-}
-
-static void read_busy(void)
-{
-    int64_t deadline_us = esp_timer_get_time() + 10 * 1000 * 1000;
-
-    while (true) {
-        if (gpio_get_level(PIN_BUSY)) {
-            ESP_LOGI(TAG, "Busy signal cleared");
-            break;
-        }
-
-        delay_ms(10);
-        if (esp_timer_get_time() > deadline_us) {
-            ESP_LOGW(TAG, "Busy signal timeout");
-            break;
-        }
-    }
-}
-
-static void reset_panel(void)
-{
-    nrst_high();
-    delay_ms(30);
-    nrst_low();
-    delay_ms(30);
-    nrst_high();
-    delay_ms(100);
-    ESP_LOGI(TAG, "Reset completed");
-}
-
-static void spi4w_write_com(uint8_t init_com)
-{
-    ndc_low();
-    delay_us(1);
-    spi_write_byte(init_com);
-    delay_us(1);
-}
-
-static void spi4w_write_data(uint8_t init_data)
-{
-    ndc_high();
-    delay_us(1);
-    spi_write_byte(init_data);
-    delay_us(1);
-}
-
-static uint8_t spi4w_read_data(void)
-{
-    ndc_high();
-    delay_us(1);
-    return spi_read_byte();
-}
-
-static void msdev_write_com(uint8_t ms_opt, uint8_t init_com)
-{
-    if (ms_opt == MASTER_ONLY) {
-        csb_low();
-        csb2_high();
-    } else if (ms_opt == SLAVE_ONLY) {
-        csb_high();
-        csb2_low();
-    } else {
-        csb_low();
-        csb2_low();
-    }
-
-    delay_us(10);
-    spi4w_write_com(init_com);
-    delay_us(10);
-    csb_high();
-    csb2_high();
-    delay_us(10);
-}
-
-static void msdev_write_data(uint8_t ms_opt, uint8_t init_data)
-{
-    if (ms_opt == MASTER_ONLY) {
-        csb_low();
-        csb2_high();
-    } else if (ms_opt == SLAVE_ONLY) {
-        csb_high();
-        csb2_low();
-    } else {
-        csb_low();
-        csb2_low();
-    }
-
-    delay_us(10);
-    spi4w_write_data(init_data);
-    delay_us(10);
-    csb_high();
-    csb2_high();
-    delay_us(10);
-}
-
-static uint8_t msdev_read_data(uint8_t ms_opt)
-{
-    uint8_t temp = 0;
-
-    if (ms_opt == MASTER_ONLY) {
-        csb_low();
-        csb2_high();
-    } else if (ms_opt == SLAVE_ONLY) {
-        csb_high();
-        csb2_low();
-    } else {
-        csb_low();
-        csb2_low();
-    }
-
-    delay_us(10);
-    temp = spi4w_read_data();
-    delay_us(10);
-    csb_high();
-    csb2_high();
-    delay_us(10);
-
-    return temp;
-}
 
 static uint8_t read_temptr(void)
 {
     uint8_t temptr_intgr;
 
-    msdev_write_com(MASTER_ONLY, 0x40);
-    delay_ms(100);
-    read_busy();
-    temptr_intgr = msdev_read_data(MASTER_ONLY);
-    (void)msdev_read_data(MASTER_ONLY);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x40);
+    epd_bus_delay_ms(100);
+    epd_bus_wait_busy();
+    temptr_intgr = epd_bus_read_data(EPD_MASTER_ONLY);
+    (void)epd_bus_read_data(EPD_MASTER_ONLY);
 
     temptr_cur = temptr_intgr;
     return temptr_intgr;
@@ -313,12 +44,12 @@ static uint8_t read_temptr(void)
 
 static void write_temptr(uint8_t temptr_lock)
 {
-    msdev_write_com(MASTER_SLAVE, 0xE0);
-    msdev_write_data(MASTER_SLAVE, 0x03);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xE0);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x03);
 
-    msdev_write_com(MASTER_SLAVE, 0xE5);
-    msdev_write_data(MASTER_SLAVE, temptr_lock);
-    read_busy();
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xE5);
+    epd_bus_write_data(EPD_MASTER_SLAVE, temptr_lock);
+    epd_bus_wait_busy();
 }
 
 static void read_otp_pwr(uint8_t temptr_opt)
@@ -326,13 +57,13 @@ static void read_otp_pwr(uint8_t temptr_opt)
     uint8_t otp_vcom;
     uint8_t temptr_val;
 
-    ms_high();
-    reset_panel();
-    ms_low();
+    epd_bus_set_master_mode(true);
+    epd_bus_reset();
+    epd_bus_set_master_mode(false);
 
-    msdev_write_com(MASTER_SLAVE, 0x00);
-    msdev_write_data(MASTER_SLAVE, 0x0F);
-    msdev_write_data(MASTER_SLAVE, 0x69);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x0F);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x69);
 
     read_temptr();
 
@@ -342,108 +73,108 @@ static void read_otp_pwr(uint8_t temptr_opt)
         temptr_val = temptr_cur;
     }
 
-    ms_high();
-    delay_us(10);
+    epd_bus_set_master_mode(true);
+    epd_bus_delay_ms(1);
 
-    msdev_write_com(MASTER_SLAVE, 0x00);
-    msdev_write_data(MASTER_SLAVE, 0x0F);
-    msdev_write_data(MASTER_SLAVE, 0x69);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x0F);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x69);
 
-    msdev_write_com(MASTER_SLAVE, 0x01);
-    msdev_write_data(MASTER_SLAVE, 0x00);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x01);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
 
     write_temptr(temptr_val);
 
-    msdev_write_com(MASTER_SLAVE, 0x04);
-    read_busy();
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x04);
+    epd_bus_wait_busy();
+    epd_bus_delay_ms(10);
 
-    msdev_write_com(MASTER_SLAVE, 0x02);
-    msdev_write_data(MASTER_SLAVE, 0x00);
-    read_busy();
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x02);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_wait_busy();
+    epd_bus_delay_ms(10);
 
-    ms_low();
-    delay_us(10);
+    epd_bus_set_master_mode(false);
+    epd_bus_delay_ms(1);
 
-    msdev_write_com(MASTER_SLAVE, 0xF0);
-    (void)msdev_read_data(MASTER_ONLY);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xF0);
+    (void)epd_bus_read_data(EPD_MASTER_ONLY);
 
     for (uint16_t j = 0; j < 207; j++) {
-        (void)msdev_read_data(MASTER_ONLY);
+        (void)epd_bus_read_data(EPD_MASTER_ONLY);
     }
 
-    otp_vcom = msdev_read_data(MASTER_ONLY);
+    otp_vcom = epd_bus_read_data(EPD_MASTER_ONLY);
 
-    msdev_write_com(MASTER_SLAVE, 0xF5);
-    msdev_write_data(MASTER_SLAVE, 0xA5);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xF5);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xA5);
 
-    msdev_write_com(MASTER_SLAVE, 0x94);
-    (void)msdev_read_data(MASTER_ONLY);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x94);
+    (void)epd_bus_read_data(EPD_MASTER_ONLY);
 
     for (uint8_t i = 0; i < 5; i++) {
-        otp_pwr[i] = msdev_read_data(MASTER_ONLY);
+        otp_pwr[i] = epd_bus_read_data(EPD_MASTER_ONLY);
     }
 
-    msdev_write_com(MASTER_SLAVE, 0xF5);
-    msdev_write_data(MASTER_SLAVE, 0x00);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xF5);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
 
-    ms_high();
-    reset_panel();
-    ms_low();
+    epd_bus_set_master_mode(true);
+    epd_bus_reset();
+    epd_bus_set_master_mode(false);
 
-    msdev_write_com(MASTER_SLAVE, 0x66);
-    msdev_write_data(MASTER_SLAVE, 0x49);
-    msdev_write_data(MASTER_SLAVE, 0x55);
-    msdev_write_data(MASTER_SLAVE, 0x13);
-    msdev_write_data(MASTER_SLAVE, 0x5D);
-    msdev_write_data(MASTER_SLAVE, 0x05);
-    msdev_write_data(MASTER_SLAVE, 0x10);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x66);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x49);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x55);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x13);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x5D);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x05);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x10);
 
-    msdev_write_com(MASTER_SLAVE, 0x13);
-    msdev_write_data(MASTER_SLAVE, 0x00);
-    msdev_write_data(MASTER_SLAVE, 0x00);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x13);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
 
-    msdev_write_com(MASTER_SLAVE, 0xE0);
-    msdev_write_data(MASTER_SLAVE, 0x01);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xE0);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x01);
 
-    msdev_write_com(MASTER_SLAVE, 0x00);
-    msdev_write_data(MASTER_SLAVE, 0x13);
-    msdev_write_data(MASTER_SLAVE, 0xE9);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x13);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xE9);
 
-    msdev_write_com(MASTER_SLAVE, 0x01);
-    msdev_write_data(MASTER_SLAVE, 0x0F);
-    msdev_write_data(MASTER_SLAVE, otp_pwr[0]);
-    msdev_write_data(MASTER_SLAVE, otp_pwr[1]);
-    msdev_write_data(MASTER_SLAVE, otp_pwr[2]);
-    msdev_write_data(MASTER_SLAVE, otp_pwr[3]);
-    msdev_write_data(MASTER_SLAVE, otp_pwr[4]);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x01);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x0F);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_pwr[0]);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_pwr[1]);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_pwr[2]);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_pwr[3]);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_pwr[4]);
 
-    msdev_write_com(MASTER_SLAVE, 0x06);
-    msdev_write_data(MASTER_SLAVE, 0xD7);
-    msdev_write_data(MASTER_SLAVE, 0xDE);
-    msdev_write_data(MASTER_SLAVE, 0x12);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x06);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xD7);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xDE);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x12);
 
-    msdev_write_com(MASTER_SLAVE, 0x61);
-    msdev_write_data(MASTER_SLAVE, 0x00);
-    msdev_write_data(MASTER_SLAVE, 0xC8);
-    msdev_write_data(MASTER_SLAVE, 0x01);
-    msdev_write_data(MASTER_SLAVE, 0x90);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x61);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xC8);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x01);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x90);
 
-    msdev_write_com(MASTER_SLAVE, 0x82);
-    msdev_write_data(MASTER_SLAVE, otp_vcom);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x82);
+    epd_bus_write_data(EPD_MASTER_SLAVE, otp_vcom);
 
-    msdev_write_com(MASTER_SLAVE, 0xE3);
-    msdev_write_data(MASTER_SLAVE, 0x01);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xE3);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x01);
 
-    msdev_write_com(MASTER_SLAVE, 0xE9);
-    msdev_write_data(MASTER_SLAVE, 0x01);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0xE9);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x01);
 }
 
 static void enter_deepsleep(void)
 {
-    msdev_write_com(MASTER_SLAVE, 0x07);
-    msdev_write_data(MASTER_SLAVE, 0xA5);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x07);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0xA5);
     ESP_LOGI(TAG, "Entered deep sleep");
 }
 
@@ -452,58 +183,64 @@ static void send_hv_stripe_data(void)
     uint32_t yield_counter = 0;
 
     ESP_LOGI(TAG, "Sending stripe data to MASTER");
-    msdev_write_com(MASTER_ONLY, 0x00);
-    msdev_write_data(MASTER_ONLY, 0x13);
-    msdev_write_data(MASTER_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x00);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0x13);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0xE9);
 
-    msdev_write_com(MASTER_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             if (col >= 82 && col < 200 && row >= 10 && row <= 36) {
-                msdev_write_data(MASTER_ONLY, WHITE);
+                epd_bus_write_data(EPD_MASTER_ONLY, WHITE);
             } else if (col >= 82 && col < 200 && row > 36 && row <= 62) {
-                msdev_write_data(MASTER_ONLY, YELLOW);
+                epd_bus_write_data(EPD_MASTER_ONLY, YELLOW);
             } else if (col >= 82 && col < 200 && row > 62 && row <= 89) {
-                msdev_write_data(MASTER_ONLY, GREEN);
+                epd_bus_write_data(EPD_MASTER_ONLY, GREEN);
             } else if (col >= 200 && col < 318 && row >= 10 && row <= 36) {
-                msdev_write_data(MASTER_ONLY, BLACK);
+                epd_bus_write_data(EPD_MASTER_ONLY, BLACK);
             } else if (col >= 200 && col < 318 && row > 36 && row <= 62) {
-                msdev_write_data(MASTER_ONLY, BLUE);
+                epd_bus_write_data(EPD_MASTER_ONLY, BLUE);
             } else if (col >= 200 && col < 318 && row > 62 && row <= 89) {
-                msdev_write_data(MASTER_ONLY, RED);
+                epd_bus_write_data(EPD_MASTER_ONLY, RED);
             } else {
-                msdev_write_data(MASTER_ONLY, WHITE);
+                epd_bus_write_data(EPD_MASTER_ONLY, WHITE);
             }
-            yield_if_needed(&yield_counter);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
     ESP_LOGI(TAG, "Sending stripe data to SLAVE");
-    msdev_write_com(SLAVE_ONLY, 0x00);
-    msdev_write_data(SLAVE_ONLY, 0x17);
-    msdev_write_data(SLAVE_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x00);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0x17);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0xE9);
 
-    msdev_write_com(SLAVE_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             if (col >= 82 && col < 200 && row >= 10 && row <= 36) {
-                msdev_write_data(SLAVE_ONLY, WHITE);
+                epd_bus_write_data(EPD_SLAVE_ONLY, WHITE);
             } else if (col >= 82 && col < 200 && row > 36 && row <= 62) {
-                msdev_write_data(SLAVE_ONLY, YELLOW);
+                epd_bus_write_data(EPD_SLAVE_ONLY, YELLOW);
             } else if (col >= 82 && col < 200 && row > 62 && row <= 89) {
-                msdev_write_data(SLAVE_ONLY, GREEN);
+                epd_bus_write_data(EPD_SLAVE_ONLY, GREEN);
             } else if (col >= 200 && col < 318 && row >= 10 && row <= 36) {
-                msdev_write_data(SLAVE_ONLY, BLACK);
+                epd_bus_write_data(EPD_SLAVE_ONLY, BLACK);
             } else if (col >= 200 && col < 318 && row > 36 && row <= 62) {
-                msdev_write_data(SLAVE_ONLY, BLUE);
+                epd_bus_write_data(EPD_SLAVE_ONLY, BLUE);
             } else if (col >= 200 && col < 318 && row > 62 && row <= 89) {
-                msdev_write_data(SLAVE_ONLY, RED);
+                epd_bus_write_data(EPD_SLAVE_ONLY, RED);
             } else {
-                msdev_write_data(SLAVE_ONLY, WHITE);
+                epd_bus_write_data(EPD_SLAVE_ONLY, WHITE);
             }
-            yield_if_needed(&yield_counter);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
@@ -515,79 +252,48 @@ static void send_hv_stripe_image_data(const uint8_t *pic)
     uint32_t yield_counter = 0;
 
     ESP_LOGI(TAG, "Sending image data to MASTER (rows 0-99)");
-    msdev_write_com(MASTER_ONLY, 0x00);
-    msdev_write_data(MASTER_ONLY, 0x13);
-    msdev_write_data(MASTER_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x00);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0x13);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0xE9);
 
-    msdev_write_com(MASTER_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             uint32_t index = (col * 200U) + (row * 2U);
             uint8_t temp1 = (uint8_t)(pic[index] & 0xF0);
             uint8_t temp2 = (uint8_t)(pic[index + 1] >> 4);
             uint8_t temp = (uint8_t)(temp1 | temp2);
-            msdev_write_data(MASTER_ONLY, temp);
-            yield_if_needed(&yield_counter);
+            epd_bus_write_data(EPD_MASTER_ONLY, temp);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
     ESP_LOGI(TAG, "Sending image data to SLAVE (rows 100-199)");
-    msdev_write_com(SLAVE_ONLY, 0x00);
-    msdev_write_data(SLAVE_ONLY, 0x17);
-    msdev_write_data(SLAVE_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x00);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0x17);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0xE9);
 
-    msdev_write_com(SLAVE_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
             uint32_t index = (col * 200U) + (row * 2U);
             uint8_t temp1 = (uint8_t)((pic[index] & 0x0F) << 4);
             uint8_t temp2 = (uint8_t)(pic[index + 1] & 0x0F);
             uint8_t temp = (uint8_t)(temp1 | temp2);
-            msdev_write_data(SLAVE_ONLY, temp);
-            yield_if_needed(&yield_counter);
+            epd_bus_write_data(EPD_SLAVE_ONLY, temp);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
     ESP_LOGI(TAG, "Image data sent");
-}
-
-static void send_hv_stripe_image_data_byte(const uint8_t *pic)
-{
-    uint32_t yield_counter = 0;
-
-    ESP_LOGI(TAG, "Sending byte-packed image data to MASTER (rows 0-99)");
-    msdev_write_com(MASTER_ONLY, 0x00);
-    msdev_write_data(MASTER_ONLY, 0x13);
-    msdev_write_data(MASTER_ONLY, 0xE9);
-
-    msdev_write_com(MASTER_ONLY, 0x10);
-    delay_ms(10);
-    for (uint16_t col = 0; col < 400; col++) {
-        for (uint16_t row = 0; row < 100; row++) {
-            uint32_t index = (col * 200U) + (row * 2U);
-            msdev_write_data(MASTER_ONLY, pic[index]);
-            yield_if_needed(&yield_counter);
-        }
-    }
-
-    ESP_LOGI(TAG, "Sending byte-packed image data to SLAVE (rows 100-199)");
-    msdev_write_com(SLAVE_ONLY, 0x00);
-    msdev_write_data(SLAVE_ONLY, 0x17);
-    msdev_write_data(SLAVE_ONLY, 0xE9);
-
-    msdev_write_com(SLAVE_ONLY, 0x10);
-    delay_ms(10);
-    for (uint16_t col = 0; col < 400; col++) {
-        for (uint16_t row = 0; row < 100; row++) {
-            uint32_t index = (col * 200U) + (row * 2U);
-            msdev_write_data(SLAVE_ONLY, pic[index + 1]);
-            yield_if_needed(&yield_counter);
-        }
-    }
-
-    ESP_LOGI(TAG, "Byte-packed image data sent");
 }
 
 static void send_hv_stripe_clean_data(void)
@@ -595,30 +301,36 @@ static void send_hv_stripe_clean_data(void)
     uint32_t yield_counter = 0;
 
     ESP_LOGI(TAG, "Sending full white data to MASTER");
-    msdev_write_com(MASTER_ONLY, 0x00);
-    msdev_write_data(MASTER_ONLY, 0x13);
-    msdev_write_data(MASTER_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x00);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0x13);
+    epd_bus_write_data(EPD_MASTER_ONLY, 0xE9);
 
-    msdev_write_com(MASTER_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_MASTER_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
-            msdev_write_data(MASTER_ONLY, WHITE);
-            yield_if_needed(&yield_counter);
+            epd_bus_write_data(EPD_MASTER_ONLY, WHITE);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
     ESP_LOGI(TAG, "Sending full white data to SLAVE");
-    msdev_write_com(SLAVE_ONLY, 0x00);
-    msdev_write_data(SLAVE_ONLY, 0x17);
-    msdev_write_data(SLAVE_ONLY, 0xE9);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x00);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0x17);
+    epd_bus_write_data(EPD_SLAVE_ONLY, 0xE9);
 
-    msdev_write_com(SLAVE_ONLY, 0x10);
-    delay_ms(10);
+    epd_bus_write_cmd(EPD_SLAVE_ONLY, 0x10);
+    epd_bus_delay_ms(10);
     for (uint16_t col = 0; col < 400; col++) {
         for (uint16_t row = 0; row < 100; row++) {
-            msdev_write_data(SLAVE_ONLY, WHITE);
-            yield_if_needed(&yield_counter);
+            epd_bus_write_data(EPD_SLAVE_ONLY, WHITE);
+            yield_counter++;
+            if ((yield_counter % 2000U) == 0U) {
+                vTaskDelay(1);
+            }
         }
     }
 
@@ -633,20 +345,20 @@ static void epd_display(uint8_t display_bkg)
     }
 
     ESP_LOGI(TAG, "Sending power on command");
-    msdev_write_com(MASTER_SLAVE, 0x04);
-    read_busy();
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x04);
+    epd_bus_wait_busy();
 
     ESP_LOGI(TAG, "Sending refresh command");
-    msdev_write_com(MASTER_SLAVE, 0x12);
-    msdev_write_data(MASTER_SLAVE, 0x00);
-    delay_ms(10);
-    read_busy();
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x12);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_delay_ms(10);
+    epd_bus_wait_busy();
 
     ESP_LOGI(TAG, "Sending power off command");
-    msdev_write_com(MASTER_SLAVE, 0x02);
-    msdev_write_data(MASTER_SLAVE, 0x00);
-    read_busy();
-    delay_ms(20);
+    epd_bus_write_cmd(EPD_MASTER_SLAVE, 0x02);
+    epd_bus_write_data(EPD_MASTER_SLAVE, 0x00);
+    epd_bus_wait_busy();
+    epd_bus_delay_ms(20);
     ESP_LOGI(TAG, "EPD display completed");
 }
 
@@ -656,9 +368,9 @@ void epd_setup(void)
         return;
     }
 
-    sys_init();
-    reset_panel();
-    read_busy();
+    epd_bus_init();
+    epd_bus_reset();
+    epd_bus_wait_busy();
     epd_ready = true;
 }
 
@@ -682,46 +394,11 @@ void epd_show_image(const uint8_t *image_data, size_t length)
 
 void epd_demo_run(void)
 {
-    sys_init();
+    epd_setup();
 
-    ESP_LOGI(TAG, "ESP32-S3 EPD Color Bar Test Start");
-
-    ESP_LOGI(TAG, "Testing SPI communication");
-    reset_panel();
-    read_busy();
-    uint8_t temp = read_temptr();
-    ESP_LOGI(TAG, "IC Temperature: %u C", temp);
-
-    if (temp < 10 || temp > 50) {
-        ESP_LOGW(TAG, "SPI communication may have issues. Check connections!");
-    }
-
-    //ESP_LOGI(TAG, "Starting color bar display");
-    reset_panel();
-    read_busy();
-    // read_otp_pwr(TEMPTR_ON);
-    // send_hv_stripe_data();
-    // epd_display(PIC_A);
-    // enter_deepsleep();
-
-    // delay_s(3);
-
-    // read_otp_pwr(TEMPTR_ON);
-    // send_hv_stripe_image_data(gImage1);
-    // epd_display(PIC_A);
-    // enter_deepsleep();
-
-    // delay_s(3);
-    ESP_LOGI(TAG, "Starting image display");
+    ESP_LOGI(TAG, "EPD demo: stripe pattern");
     read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_image_data_byte(gImagetestMe);
+    send_hv_stripe_data();
     epd_display(PIC_A);
     enter_deepsleep();
-
-    delay_s(5);
-
-    // read_otp_pwr(TEMPTR_ON);
-    // send_hv_stripe_clean_data();
-    // epd_display(PIC_A);
-    // enter_deepsleep();
 }

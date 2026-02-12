@@ -21,6 +21,11 @@ static const char *TAG = "image_upload";
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
+static bool s_netif_ready;
+static bool s_event_loop_ready;
+static bool s_handlers_registered;
+static bool s_wifi_started;
+static esp_netif_t *s_sta_netif;
 
 static image_upload_handler_t s_handler;
 static size_t s_expected_size;
@@ -31,6 +36,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "WiFi disconnect reason: %u", event->reason);
         if (s_retry_num < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
@@ -44,36 +51,69 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        ESP_LOGW(TAG, "Lost IP address");
     }
 }
 
 static esp_err_t wifi_init_sta(void)
 {
-    s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) {
+        s_wifi_event_group = xEventGroupCreate();
+    }
 
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init failed");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop init failed");
-    esp_netif_create_default_wifi_sta();
+    if (!s_netif_ready) {
+        esp_err_t netif_ret = esp_netif_init();
+        if (netif_ret != ESP_OK && netif_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(netif_ret, TAG, "netif init failed");
+        }
+        s_netif_ready = true;
+    }
+
+    if (!s_event_loop_ready) {
+        esp_err_t loop_ret = esp_event_loop_create_default();
+        if (loop_ret != ESP_OK && loop_ret != ESP_ERR_INVALID_STATE) {
+            ESP_RETURN_ON_ERROR(loop_ret, TAG, "event loop init failed");
+        }
+        s_event_loop_ready = true;
+    }
+
+    if (!s_sta_netif) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
 
-    ESP_RETURN_ON_ERROR(
-        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler,
-                                            NULL, NULL),
-        TAG, "wifi handler register failed");
-    ESP_RETURN_ON_ERROR(
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler,
-                                            NULL, NULL),
-        TAG, "ip handler register failed");
+        if (!s_handlers_registered) {
+            ESP_RETURN_ON_ERROR(
+                esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                    &wifi_event_handler, NULL, NULL),
+                TAG, "wifi handler register failed");
+            ESP_RETURN_ON_ERROR(
+                esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                    &wifi_event_handler, NULL, NULL),
+                TAG, "ip handler register failed");
+            s_handlers_registered = true;
+        }
+    }
 
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = CONFIG_WIFI_SSID,
             .password = CONFIG_WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .threshold.authmode = WIFI_AUTH_WPA2_WPA3_PSK,
+            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false,
+            },
         },
     };
+
+    ESP_LOGI(TAG, "WiFi SSID: %s", (const char *)wifi_config.sta.ssid);
+    ESP_LOGI(TAG, "WiFi password: %s", (const char *)wifi_config.sta.password);
 
     if (strlen((const char *)wifi_config.sta.ssid) == 0) {
         ESP_LOGE(TAG, "WiFi SSID is empty. Configure CONFIG_WIFI_SSID");
@@ -84,9 +124,31 @@ static esp_err_t wifi_init_sta(void)
         wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
     }
 
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set config failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+    if (!s_wifi_started) {
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG,
+                            "set storage failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG,
+                            "set config failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "set power save failed");
+        if (s_sta_netif) {
+            esp_err_t dhcp_ret = esp_netif_dhcpc_start(s_sta_netif);
+            if (dhcp_ret != ESP_OK && dhcp_ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "DHCP client start failed: %s", esp_err_to_name(dhcp_ret));
+            } else {
+                ESP_LOGI(TAG, "DHCP client started");
+            }
+        }
+        s_wifi_started = true;
+    }
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    esp_err_t connect_ret = esp_wifi_connect();
+    if (connect_ret != ESP_OK && connect_ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGE(TAG, "wifi connect failed: %s", esp_err_to_name(connect_ret));
+        return connect_ret;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -130,11 +192,43 @@ static esp_err_t spiffs_init(void)
     return ESP_OK;
 }
 
+static esp_err_t send_spiffs_file(httpd_req_t *req, const char *path, const char *type)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, type);
+    char chunk[1024];
+    size_t read_bytes = 0;
+    while ((read_bytes = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, read_bytes) != ESP_OK) {
+            fclose(file);
+            httpd_resp_sendstr_chunk(req, NULL);
+            return ESP_FAIL;
+        }
+    }
+
+    fclose(file);
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
 static esp_err_t handle_root_get(httpd_req_t *req)
 {
-    const char *resp = "EPD uploader: POST /image with raw sp6 bytes";
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+    return send_spiffs_file(req, "/spiffs/index.html", "text/html");
+}
+
+static esp_err_t handle_app_js(httpd_req_t *req)
+{
+    return send_spiffs_file(req, "/spiffs/app.js", "application/javascript");
+}
+
+static esp_err_t handle_styles_css(httpd_req_t *req)
+{
+    return send_spiffs_file(req, "/spiffs/styles.css", "text/css");
 }
 
 static esp_err_t handle_image_post(httpd_req_t *req)
@@ -209,6 +303,22 @@ static httpd_handle_t start_webserver(void)
     };
     httpd_register_uri_handler(server, &root);
 
+    httpd_uri_t app_js = {
+        .uri = "/app.js",
+        .method = HTTP_GET,
+        .handler = handle_app_js,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &app_js);
+
+    httpd_uri_t styles_css = {
+        .uri = "/styles.css",
+        .method = HTTP_GET,
+        .handler = handle_styles_css,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &styles_css);
+
     httpd_uri_t image = {
         .uri = "/image",
         .method = HTTP_POST,
@@ -232,7 +342,13 @@ void image_upload_start(image_upload_handler_t handler, size_t expected_size)
     }
 
     ESP_ERROR_CHECK(spiffs_init());
-    ESP_ERROR_CHECK(wifi_init_sta());
+
+    esp_err_t wifi_ret = wifi_init_sta();
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi init failed: %s", esp_err_to_name(wifi_ret));
+        return;
+    }
+
     start_webserver();
     ESP_LOGI(TAG, "HTTP server ready: POST /image");
 }
