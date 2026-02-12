@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "esp_spiffs.h"
 #include "esp_wifi.h"
+#include "heatshrink_decoder.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
@@ -20,6 +21,19 @@ static const char *TAG = "image_upload";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 #define WIFI_MAXIMUM_RETRY 10
+
+#define RLE_MAGIC_0 0x53
+#define RLE_MAGIC_1 0x50
+#define RLE_MAGIC_2 0x36
+#define RLE_MAGIC_3 0x52
+#define RLE_HEADER_SIZE 8
+
+#define HS_MAGIC_0 0x48
+#define HS_MAGIC_1 0x53
+#define HS_MAGIC_2 0x4B
+#define HS_MAGIC_3 0x31
+#define HS_HEADER_SIZE 10
+#define HS_INPUT_BUFFER_SIZE 256
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
@@ -32,6 +46,129 @@ static esp_netif_t *s_ap_netif;
 
 static image_upload_handler_t s_handler;
 static size_t s_expected_size;
+
+static bool decode_rle_sp6_nibbles(const uint8_t *input, size_t input_len,
+                                   uint8_t *output, size_t output_len)
+{
+    if (input_len < RLE_HEADER_SIZE) {
+        return false;
+    }
+
+    size_t pos = RLE_HEADER_SIZE;
+    size_t nibble_index = 0;
+    size_t nibble_total = output_len * 2U;
+
+    while (pos + 1 < input_len && nibble_index < nibble_total) {
+        uint8_t run_len = input[pos];
+        uint8_t value = input[pos + 1] & 0x0F;
+        pos += 2;
+
+        if (run_len == 0) {
+            return false;
+        }
+
+        for (uint8_t i = 0; i < run_len; i++) {
+            if (nibble_index >= nibble_total) {
+                return false;
+            }
+            size_t byte_index = nibble_index / 2U;
+            if ((nibble_index & 1U) == 0U) {
+                output[byte_index] = (uint8_t)(value << 4);
+            } else {
+                output[byte_index] |= value;
+            }
+            nibble_index++;
+        }
+    }
+
+    return nibble_index == nibble_total;
+}
+
+static bool decode_heatshrink(const uint8_t *input, size_t input_len,
+                              uint8_t *output, size_t output_len)
+{
+    if (input_len < HS_HEADER_SIZE) {
+        return false;
+    }
+
+    uint8_t window_bits = input[8];
+    uint8_t lookahead_bits = input[9];
+    heatshrink_decoder *decoder = heatshrink_decoder_alloc(
+        HS_INPUT_BUFFER_SIZE, window_bits, lookahead_bits);
+    if (!decoder) {
+        return false;
+    }
+
+    size_t input_pos = HS_HEADER_SIZE;
+    size_t output_pos = 0;
+
+    while (input_pos < input_len) {
+        size_t sunk = 0;
+        HSD_sink_res sink_res = heatshrink_decoder_sink(
+            decoder, (uint8_t *)input + input_pos, input_len - input_pos, &sunk);
+        input_pos += sunk;
+        if (sink_res < 0) {
+            heatshrink_decoder_free(decoder);
+            return false;
+        }
+
+        while (1) {
+            size_t polled = 0;
+            if (output_pos >= output_len) {
+                heatshrink_decoder_free(decoder);
+                return false;
+            }
+            HSD_poll_res poll_res = heatshrink_decoder_poll(
+                decoder, output + output_pos, output_len - output_pos, &polled);
+            output_pos += polled;
+            if (poll_res == HSDR_POLL_MORE) {
+                continue;
+            }
+            if (poll_res == HSDR_POLL_EMPTY) {
+                break;
+            }
+            if (poll_res < 0) {
+                heatshrink_decoder_free(decoder);
+                return false;
+            }
+        }
+    }
+
+    while (1) {
+        HSD_finish_res finish_res = heatshrink_decoder_finish(decoder);
+        if (finish_res == HSDR_FINISH_DONE) {
+            break;
+        }
+        if (finish_res < 0) {
+            heatshrink_decoder_free(decoder);
+            return false;
+        }
+
+        while (1) {
+            size_t polled = 0;
+            if (output_pos >= output_len) {
+                heatshrink_decoder_free(decoder);
+                return false;
+            }
+            HSD_poll_res poll_res = heatshrink_decoder_poll(
+                decoder, output + output_pos, output_len - output_pos, &polled);
+            output_pos += polled;
+            if (poll_res == HSDR_POLL_MORE) {
+                continue;
+            }
+            if (poll_res == HSDR_POLL_EMPTY) {
+                break;
+            }
+            if (poll_res < 0) {
+                heatshrink_decoder_free(decoder);
+                return false;
+            }
+        }
+    }
+
+    heatshrink_decoder_free(decoder);
+    return output_pos == output_len;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
                                void *event_data)
@@ -311,55 +448,142 @@ static esp_err_t handle_styles_css(httpd_req_t *req)
     return send_spiffs_file(req, "/spiffs/styles.css", "text/css");
 }
 
+static esp_err_t handle_heatshrink_wasm(httpd_req_t *req)
+{
+    return send_spiffs_file(req, "/spiffs/heatshrink.wasm", "application/wasm");
+}
+
 static esp_err_t handle_image_post(httpd_req_t *req)
 {
-    if (req->content_len != (int)s_expected_size) {
-        ESP_LOGW(TAG, "Invalid size: %d (expected %u)", req->content_len,
-                 (unsigned)s_expected_size);
+    if (req->content_len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
         return ESP_FAIL;
     }
 
-    FILE *file = fopen("/spiffs/image.sp6", "wb");
-    if (!file) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file");
-        return ESP_FAIL;
-    }
-
-    uint8_t *buffer = malloc(s_expected_size);
-    if (!buffer) {
-        fclose(file);
+    size_t input_len = (size_t)req->content_len;
+    uint8_t *input = malloc(input_len);
+    if (!input) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
 
     size_t received = 0;
-    while (received < s_expected_size) {
-        int chunk = httpd_req_recv(req, (char *)buffer + received,
-                                   s_expected_size - received);
+    while (received < input_len) {
+        int chunk = httpd_req_recv(req, (char *)input + received, input_len - received);
         if (chunk <= 0) {
-            free(buffer);
-            fclose(file);
+            free(input);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
-            return ESP_FAIL;
-        }
-        if (fwrite(buffer + received, 1, chunk, file) != (size_t)chunk) {
-            free(buffer);
-            fclose(file);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
             return ESP_FAIL;
         }
         received += (size_t)chunk;
     }
 
-    fclose(file);
-    ESP_LOGI(TAG, "Image received (%u bytes)", (unsigned)received);
+    const uint8_t *raw = input;
+    size_t raw_len = input_len;
+    uint8_t *decoded = NULL;
 
-    if (s_handler) {
-        s_handler(buffer, received);
+    bool has_hs_header = input_len >= HS_HEADER_SIZE &&
+                         input[0] == HS_MAGIC_0 &&
+                         input[1] == HS_MAGIC_1 &&
+                         input[2] == HS_MAGIC_2 &&
+                         input[3] == HS_MAGIC_3;
+
+    bool has_rle_header = input_len >= RLE_HEADER_SIZE &&
+                          input[0] == RLE_MAGIC_0 &&
+                          input[1] == RLE_MAGIC_1 &&
+                          input[2] == RLE_MAGIC_2 &&
+                          input[3] == RLE_MAGIC_3;
+
+    if (has_hs_header) {
+        uint32_t decoded_size = (uint32_t)input[4] |
+                                ((uint32_t)input[5] << 8) |
+                                ((uint32_t)input[6] << 16) |
+                                ((uint32_t)input[7] << 24);
+        if (decoded_size != s_expected_size) {
+            free(input);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid heatshrink size");
+            return ESP_FAIL;
+        }
+
+        decoded = malloc(s_expected_size);
+        if (!decoded) {
+            free(input);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_FAIL;
+        }
+
+        if (!decode_heatshrink(input, input_len, decoded, s_expected_size)) {
+            free(decoded);
+            free(input);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Heatshrink decode failed");
+            return ESP_FAIL;
+        }
+
+        raw = decoded;
+        raw_len = s_expected_size;
+        ESP_LOGI(TAG, "Image received (heatshrink %u bytes -> raw %u bytes)",
+                 (unsigned)input_len, (unsigned)raw_len);
+    } else if (has_rle_header) {
+        uint32_t decoded_size = (uint32_t)input[4] |
+                                ((uint32_t)input[5] << 8) |
+                                ((uint32_t)input[6] << 16) |
+                                ((uint32_t)input[7] << 24);
+        if (decoded_size != s_expected_size) {
+            free(input);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid RLE size");
+            return ESP_FAIL;
+        }
+
+        decoded = malloc(s_expected_size);
+        if (!decoded) {
+            free(input);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_FAIL;
+        }
+
+        if (!decode_rle_sp6_nibbles(input, input_len, decoded, s_expected_size)) {
+            free(decoded);
+            free(input);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "RLE decode failed");
+            return ESP_FAIL;
+        }
+
+        raw = decoded;
+        raw_len = s_expected_size;
+        ESP_LOGI(TAG, "Image received (rle %u bytes -> raw %u bytes)",
+                 (unsigned)input_len, (unsigned)raw_len);
+    } else if (input_len != s_expected_size) {
+        free(input);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid content length");
+        return ESP_FAIL;
+    } else {
+        ESP_LOGI(TAG, "Image received (raw %u bytes)", (unsigned)raw_len);
     }
 
-    free(buffer);
+    FILE *file = fopen("/spiffs/image.sp6", "wb");
+    if (!file) {
+        free(decoded);
+        free(input);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file");
+        return ESP_FAIL;
+    }
+
+    if (fwrite(raw, 1, raw_len, file) != raw_len) {
+        fclose(file);
+        free(decoded);
+        free(input);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
+        return ESP_FAIL;
+    }
+
+    fclose(file);
+
+    if (s_handler) {
+        s_handler(raw, raw_len);
+    }
+
+    free(decoded);
+    free(input);
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
@@ -398,6 +622,14 @@ static httpd_handle_t start_webserver(void)
         .user_ctx = NULL,
     };
     httpd_register_uri_handler(server, &styles_css);
+
+    httpd_uri_t heatshrink_wasm = {
+        .uri = "/heatshrink.wasm",
+        .method = HTTP_GET,
+        .handler = handle_heatshrink_wasm,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &heatshrink_wasm);
 
     httpd_uri_t image = {
         .uri = "/image",

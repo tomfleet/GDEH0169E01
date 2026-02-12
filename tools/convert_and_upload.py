@@ -51,6 +51,15 @@ def main() -> int:
         default="sp6",
         help="Output packing: sp6 (default), nibble, or byte",
     )
+    parser.add_argument("--rle", action="store_true", help="Upload with nibble RLE")
+    parser.add_argument("--heatshrink-wasm", action="store_true",
+                        help="Upload with heatshrink (WASM encoder)")
+    parser.add_argument("--wasm", default="",
+                        help="Path to heatshrink.wasm for encoding")
+    parser.add_argument("--window-bits", type=int, default=10,
+                        help="Heatshrink window bits")
+    parser.add_argument("--lookahead-bits", type=int, default=4,
+                        help="Heatshrink lookahead bits")
     parser.add_argument("--keep-raw", action="store_true", help="Keep the temporary raw file")
     args = parser.parse_args()
 
@@ -87,13 +96,23 @@ def main() -> int:
 
     run(cmd)
 
-    run([
+    upload_cmd = [
         sys.executable,
         str(uploader),
         str(raw_path),
         "--url",
         args.url,
-    ])
+    ]
+    if args.heatshrink_wasm:
+        upload_cmd.append("--heatshrink-wasm")
+        if args.wasm:
+            upload_cmd.extend(["--wasm", args.wasm])
+        upload_cmd.extend(["--window-bits", str(args.window_bits)])
+        upload_cmd.extend(["--lookahead-bits", str(args.lookahead_bits)])
+    elif args.rle:
+        upload_cmd.append("--rle")
+
+    run(upload_cmd)
 
     if args.keep_raw:
         print(f"Raw saved to: {raw_path}")

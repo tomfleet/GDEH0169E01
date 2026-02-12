@@ -21,6 +21,10 @@ const PALETTE = [
 ];
 
 const PANEL_ROTATION_DEG = 180;
+const RLE_MAGIC = [0x53, 0x50, 0x36, 0x52];
+const HS_MAGIC = [0x48, 0x53, 0x4b, 0x31];
+const HS_WINDOW_BITS = 10;
+const HS_LOOKAHEAD_BITS = 4;
 
 let sourceImage = null;
 let scale = 1;
@@ -29,7 +33,13 @@ let isDragging = false;
 let dragStart = { x: 0, y: 0 };
 let pendingRender = false;
 let lastRawBytes = null;
+let lastRleBytes = null;
+let lastHeatshrinkBytes = null;
 let userRotationDeg = 0;
+
+let heatshrinkReady = null;
+let heatshrinkExports = null;
+let heatshrinkHeap = null;
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -70,6 +80,96 @@ function scheduleRender() {
     drawCrop();
     renderPreview();
   });
+}
+
+async function loadHeatshrinkWasm() {
+  if (heatshrinkReady) return heatshrinkReady;
+  heatshrinkReady = (async () => {
+    try {
+      const response = await fetch("/heatshrink.wasm");
+      if (!response.ok) {
+        return false;
+      }
+      let result = null;
+      if (WebAssembly.instantiateStreaming) {
+        try {
+          result = await WebAssembly.instantiateStreaming(response, {});
+        } catch (err) {
+          const bytes = await response.arrayBuffer();
+          result = await WebAssembly.instantiate(bytes, {});
+        }
+      } else {
+        const bytes = await response.arrayBuffer();
+        result = await WebAssembly.instantiate(bytes, {});
+      }
+      const exports = result.instance.exports;
+      if (!exports.memory || !exports.hs_alloc || !exports.hs_free || !exports.hs_encode) {
+        return false;
+      }
+      heatshrinkExports = exports;
+      heatshrinkHeap = new Uint8Array(exports.memory.buffer);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  })();
+  return heatshrinkReady;
+}
+
+function refreshHeatshrinkHeap() {
+  if (heatshrinkExports && heatshrinkExports.memory) {
+    heatshrinkHeap = new Uint8Array(heatshrinkExports.memory.buffer);
+  }
+}
+
+async function encodeHeatshrink(rawBytes) {
+  const ok = await loadHeatshrinkWasm();
+  if (!ok || !heatshrinkExports) return null;
+
+  const extra = Math.max(64, Math.ceil(rawBytes.length / 8));
+  const outCap = rawBytes.length + extra;
+
+  const inPtr = heatshrinkExports.hs_alloc(rawBytes.length);
+  const outPtr = heatshrinkExports.hs_alloc(outCap);
+  if (!inPtr || !outPtr) {
+    if (inPtr) heatshrinkExports.hs_free(inPtr);
+    if (outPtr) heatshrinkExports.hs_free(outPtr);
+    return null;
+  }
+
+  refreshHeatshrinkHeap();
+  heatshrinkHeap.set(rawBytes, inPtr);
+  const outSize = heatshrinkExports.hs_encode(
+    inPtr,
+    rawBytes.length,
+    outPtr,
+    outCap,
+    HS_WINDOW_BITS,
+    HS_LOOKAHEAD_BITS
+  );
+
+  let encoded = null;
+  if (outSize > 0) {
+    refreshHeatshrinkHeap();
+    const header = new Uint8Array(10);
+    header.set(HS_MAGIC, 0);
+    const size = rawBytes.length >>> 0;
+    header[4] = size & 0xff;
+    header[5] = (size >> 8) & 0xff;
+    header[6] = (size >> 16) & 0xff;
+    header[7] = (size >> 24) & 0xff;
+    header[8] = HS_WINDOW_BITS & 0xff;
+    header[9] = HS_LOOKAHEAD_BITS & 0xff;
+
+    const payload = heatshrinkHeap.slice(outPtr, outPtr + outSize);
+    encoded = new Uint8Array(header.length + payload.length);
+    encoded.set(header, 0);
+    encoded.set(payload, header.length);
+  }
+
+  heatshrinkExports.hs_free(inPtr);
+  heatshrinkExports.hs_free(outPtr);
+  return encoded;
 }
 
 function nearestColor(r, g, b) {
@@ -206,6 +306,43 @@ function packSp6() {
   return out;
 }
 
+function encodeRleSp6Nibbles(rawBytes) {
+  const out = [];
+  out.push(...RLE_MAGIC);
+  const rawSize = rawBytes.length;
+  out.push(rawSize & 0xff, (rawSize >> 8) & 0xff, (rawSize >> 16) & 0xff, (rawSize >> 24) & 0xff);
+
+  let runValue = null;
+  let runLength = 0;
+  const flush = () => {
+    if (runLength === 0) return;
+    out.push(runLength & 0xff, runValue & 0x0f);
+    runLength = 0;
+  };
+
+  for (let i = 0; i < rawBytes.length; i++) {
+    const byte = rawBytes[i];
+    const nibbles = [(byte >> 4) & 0x0f, byte & 0x0f];
+    for (const nibble of nibbles) {
+      if (runValue === null) {
+        runValue = nibble;
+        runLength = 1;
+        continue;
+      }
+      if (nibble === runValue && runLength < 255) {
+        runLength++;
+      } else {
+        flush();
+        runValue = nibble;
+        runLength = 1;
+      }
+    }
+  }
+  flush();
+
+  return new Uint8Array(out);
+}
+
 fileInput.addEventListener("change", (event) => {
   const file = event.target.files[0];
   if (!file) return;
@@ -255,28 +392,46 @@ cropCanvas.addEventListener("pointerleave", () => {
   isDragging = false;
 });
 
-convertBtn.addEventListener("click", () => {
+convertBtn.addEventListener("click", async () => {
   if (!sourceImage) {
     setStatus("Load an image first");
     return;
   }
   renderPreview();
   lastRawBytes = packSp6();
-  setStatus("Converted to sp6");
+  lastHeatshrinkBytes = await encodeHeatshrink(lastRawBytes);
+
+  const candidateRle = encodeRleSp6Nibbles(lastRawBytes);
+  lastRleBytes = candidateRle.length < lastRawBytes.length ? candidateRle : null;
+
+  if (lastHeatshrinkBytes && lastHeatshrinkBytes.length < lastRawBytes.length) {
+    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, heatshrink ${lastHeatshrinkBytes.length} bytes)`);
+  } else if (lastRleBytes) {
+    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, rle ${lastRleBytes.length} bytes)`);
+  } else {
+    setStatus(`Converted to sp6 (${lastRawBytes.length} bytes, no compression)`);
+  }
 });
 
 uploadBtn.addEventListener("click", async () => {
   if (!lastRawBytes) {
     renderPreview();
     lastRawBytes = packSp6();
+    lastHeatshrinkBytes = await encodeHeatshrink(lastRawBytes);
+    const candidateRle = encodeRleSp6Nibbles(lastRawBytes);
+    lastRleBytes = candidateRle.length < lastRawBytes.length ? candidateRle : null;
   }
   const url = deviceUrlInput.value || "/image";
   setStatus("Uploading...");
   try {
+    const payload =
+      (lastHeatshrinkBytes && lastHeatshrinkBytes.length < lastRawBytes.length)
+        ? lastHeatshrinkBytes
+        : (lastRleBytes || lastRawBytes);
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
-      body: lastRawBytes,
+      body: payload,
     });
     if (!response.ok) {
       throw new Error(`Upload failed: ${response.status}`);
@@ -303,4 +458,5 @@ downloadBtn.addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
+loadHeatshrinkWasm();
 scheduleRender();
