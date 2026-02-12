@@ -163,7 +163,7 @@ def write_c_array(path: Path, var_name: str, data: Iterable[int]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="Input image (PNG/JPG/etc)")
-    parser.add_argument("output", help="Output C header file")
+    parser.add_argument("output", help="Output file path")
     parser.add_argument("--name", default="gImage1", help="C array name")
     parser.add_argument("--size", type=int, default=400, help="Output size")
     parser.add_argument("--round-mask", action="store_true", help="Mask outside the circle to white")
@@ -196,6 +196,17 @@ def main() -> int:
         default="sp6",
         help="Output packing: sp6 (default), nibble, or byte (0x11/0x22/etc)",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=["c", "raw", "both"],
+        default="c",
+        help="Output format: c header, raw bytes, or both",
+    )
+    parser.add_argument(
+        "--raw-output",
+        default="",
+        help="Raw output path when using --output-format both",
+    )
     args = parser.parse_args()
 
     img = Image.open(args.input).convert("RGB")
@@ -221,7 +232,16 @@ def main() -> int:
     if len(data) != expected:
         raise RuntimeError(f"Unexpected output size: {len(data)} (expected {expected})")
 
-    write_c_array(Path(args.output), args.name, data)
+    output_path = Path(args.output)
+    if args.output_format == "raw":
+        output_path.write_bytes(data)
+    elif args.output_format == "both":
+        if not args.raw_output:
+            raise RuntimeError("--raw-output is required for --output-format both")
+        write_c_array(output_path, args.name, data)
+        Path(args.raw_output).write_bytes(data)
+    else:
+        write_c_array(output_path, args.name, data)
     return 0
 
 

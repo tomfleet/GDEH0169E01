@@ -12,7 +12,7 @@
 #include "esp_timer.h"
 
 #include "pins.h"
-#include "image.h"
+#include "imageme.h"
 #include "image2.h"
 #define MASTER_ONLY 0
 #define SLAVE_ONLY 1
@@ -43,6 +43,7 @@ static uint8_t otp_pwr[5];
 
 static spi_device_handle_t spi_handle;
 static bool spi_ready;
+static bool epd_ready;
 
 static inline void delay_us(uint32_t time_us)
 {
@@ -649,6 +650,36 @@ static void epd_display(uint8_t display_bkg)
     ESP_LOGI(TAG, "EPD display completed");
 }
 
+void epd_setup(void)
+{
+    if (epd_ready) {
+        return;
+    }
+
+    sys_init();
+    reset_panel();
+    read_busy();
+    epd_ready = true;
+}
+
+void epd_show_image(const uint8_t *image_data, size_t length)
+{
+    const size_t expected = 400U * 400U / 2U;
+    if (!image_data || length != expected) {
+        ESP_LOGE(TAG, "Invalid image data length: %u (expected %u)",
+                 (unsigned)length, (unsigned)expected);
+        return;
+    }
+
+    if (!epd_ready) {
+        epd_setup();
+    }
+
+    read_otp_pwr(TEMPTR_ON);
+    send_hv_stripe_image_data(image_data);
+    epd_display(PIC_A);
+}
+
 void epd_demo_run(void)
 {
     sys_init();
@@ -683,7 +714,7 @@ void epd_demo_run(void)
     // delay_s(3);
     ESP_LOGI(TAG, "Starting image display");
     read_otp_pwr(TEMPTR_ON);
-    send_hv_stripe_image_data_byte(gImagetest2);
+    send_hv_stripe_image_data_byte(gImagetestMe);
     epd_display(PIC_A);
     enter_deepsleep();
 

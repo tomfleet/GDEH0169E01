@@ -12,6 +12,7 @@
 #include "esp_system.h"
 
 #include "epd_169inch.h"
+#include "image_upload.h"
 
 void app_main(void)
 {
@@ -42,5 +43,6 @@ void app_main(void)
 
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 
-    epd_demo_run();
+    epd_setup();
+    image_upload_start(epd_show_image, 400U * 400U / 2U);
 }
